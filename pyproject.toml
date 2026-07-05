@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icloud-photo-sync"
+version = "0.1.0"
+description = "One-way iCloud Photos downloader for macOS: ./YYYY/MM by capture date, with stop/resume and incremental update."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["icloud", "photos", "backup", "download", "macos"]
+
+# Apple compatibility is version-sensitive; pyicloud is pinned to the tested
+# major. See README "Tested versions".
+dependencies = [
+    "pyicloud>=2.6.5,<3",
+    "keyring>=24",
+    "requests>=2.31",
+    "typer>=0.12",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+icloud-photo-sync = "icloud_photo_sync.cli:main_entry"
+
+[tool.setuptools]
+packages = ["icloud_photo_sync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,10 @@
+# Exact versions tested on macOS (Apple Silicon), Python 3.13, 2026-06.
+# Apple changes auth periodically; if logins break, first try bumping pyicloud.
+pyicloud==2.6.5
+keyring==25.7.0
+requests==2.34.2
+typer==0.26.8
+tqdm==4.68.3
+
+# Dev / tests
+pytest==9.1.1
