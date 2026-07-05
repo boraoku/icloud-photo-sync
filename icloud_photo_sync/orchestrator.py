@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 
@@ -29,13 +28,9 @@ from .icloud_client import ICloudClient
 from .logutil import get_logger
 from .models import AssetRef, DownloadOutcome
 from .paths import PathResolver
-from .state import StateStore
+from .state import StateStore, utc_now_iso as _now
 
 logger = get_logger(__name__)
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -96,7 +91,11 @@ class Orchestrator:
         try:
             for asset in self.client.iter_all_assets():
                 self._raise_if_cancelled()
-                stats.add(self._process(asset))
+                row = self.state.get(asset.id)
+                if row is not None and row["status"] == "completed" and self._on_disk_ok(asset, row):
+                    stats.skipped += 1  # fast path: one SELECT + one stat, no writes
+                else:
+                    stats.add(self._process(asset))
                 seen += 1
                 self._heartbeat(seen, total, stats)
             self.state.set_meta("last_full_pass_at", _now())

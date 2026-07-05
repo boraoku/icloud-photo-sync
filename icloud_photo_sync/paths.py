@@ -79,6 +79,3 @@ class PathResolver:
 
     def absolute(self, rel: Path) -> Path:
         return self.root / rel
-
-    def ensure_parent(self, abs_path: Path) -> None:
-        abs_path.parent.mkdir(parents=True, exist_ok=True)

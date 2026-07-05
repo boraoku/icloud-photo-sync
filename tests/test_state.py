@@ -107,3 +107,19 @@ def test_update_dest(store):
     store.register(_asset(), "old/path.HEIC")
     store.update_dest("a1", "new/path.HEIC")
     assert store.get("a1")["dest_path"] == "new/path.HEIC"
+
+
+def test_batched_commits_persist_across_reopen(tmp_path):
+    """Mutations are batched; close() must flush them durably."""
+    db = tmp_path / "reopen.db"
+    s1 = StateStore(db)
+    s1.register(_asset(), "2026/07/IMG.HEIC")
+    s1.mark_completed("a1", 100)
+    s1.close()
+    s2 = StateStore(db)
+    try:
+        row = s2.get("a1")
+        assert row["status"] == "completed"
+        assert row["bytes_done"] == 100
+    finally:
+        s2.close()

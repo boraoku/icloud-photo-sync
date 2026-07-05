@@ -111,3 +111,33 @@ def test_on_disk_ok_falls_back_to_recorded_size(orch):
 
     abs_dest.write_bytes(b"g" * 100)  # full size again
     assert orch._on_disk_ok(degraded, row) is True
+
+
+def test_run_full_skips_completed_without_touching_downloader(orch, tmp_path):
+    """A no-op rerun must not invoke the downloader or rewrite rows."""
+
+    class OneAssetClient:
+        def count(self):
+            return 1
+
+        def iter_all_assets(self):
+            yield make_asset(size=100)
+
+    class ExplodingDownloader:
+        def download(self, asset, dest):
+            raise AssertionError("downloader must not run for a completed asset")
+
+    asset = make_asset(size=100)
+    rel = orch._resolve_dest(asset)
+    abs_dest = orch.paths.absolute(rel)
+    abs_dest.parent.mkdir(parents=True, exist_ok=True)
+    abs_dest.write_bytes(b"x" * 100)
+    orch.state.mark_completed("a1", 100)
+    before = orch.state.get("a1")["updated_at"]
+
+    orch.client = OneAssetClient()
+    orch.downloader = ExplodingDownloader()
+    stats = orch.run_full()
+
+    assert stats.skipped == 1 and stats.downloaded == 0 and stats.failed == 0
+    assert orch.state.get("a1")["updated_at"] == before  # row untouched

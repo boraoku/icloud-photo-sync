@@ -12,6 +12,7 @@ tree stays clean while each output folder keeps its own manifest.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,12 +44,23 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
-def _now() -> str:
+def utc_now_iso() -> str:
+    """Timestamp format shared by every column in this database."""
     return datetime.now(timezone.utc).isoformat()
+
+
+_now = utc_now_iso
 
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
+
+
+# Mutations are batched: progress rows are advisory (the filesystem holds the
+# truth — completed files by their size, partials by their .part), so losing
+# the last couple of seconds on a crash only costs re-verifying a few files.
+COMMIT_EVERY_OPS = 200
+COMMIT_EVERY_SECS = 2.0
 
 
 class StateStore:
@@ -64,12 +76,26 @@ class StateStore:
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._dirty = 0
+        self._last_commit = time.monotonic()
         if self.get_meta("schema_version") is None:
             self.set_meta("schema_version", SCHEMA_VERSION)
 
+    def _maybe_commit(self) -> None:
+        self._dirty += 1
+        now = time.monotonic()
+        if self._dirty >= COMMIT_EVERY_OPS or now - self._last_commit >= COMMIT_EVERY_SECS:
+            self.flush()
+
+    def flush(self) -> None:
+        """Commit any batched mutations."""
+        self._conn.commit()
+        self._dirty = 0
+        self._last_commit = time.monotonic()
+
     def close(self) -> None:
         try:
-            self._conn.commit()
+            self.flush()
         finally:
             self._conn.close()
 
@@ -118,7 +144,7 @@ class StateStore:
                 _now(),
             ),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def record_partial(self, asset_id: str, bytes_done: int) -> None:
         self._conn.execute(
@@ -126,7 +152,7 @@ class StateStore:
             "WHERE id = ?",
             (bytes_done, _now(), asset_id),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def mark_completed(self, asset_id: str, size: int) -> None:
         self._conn.execute(
@@ -135,14 +161,14 @@ class StateStore:
             "WHERE id = ?",
             (size, size, _now(), asset_id),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def mark_failed(self, asset_id: str, error: str) -> None:
         self._conn.execute(
             "UPDATE assets SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
             (error[:1000], _now(), asset_id),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def update_dest(self, asset_id: str, dest_rel: str) -> None:
         """Re-point an asset to a new destination (collision re-resolution)."""
@@ -150,7 +176,7 @@ class StateStore:
             "UPDATE assets SET dest_path = ?, updated_at = ? WHERE id = ?",
             (dest_rel, _now(), asset_id),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def path_owner(self, dest_rel: str) -> str | None:
         """Asset id that already claims ``dest_rel``, or None."""
@@ -178,11 +204,11 @@ class StateStore:
         )
         return int(cur.fetchone()["b"])
 
-    def iter_failed(self) -> list[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM assets WHERE status = 'failed' ORDER BY updated_at DESC"
-        )
-        return cur.fetchall()
+    def iter_failed(self, limit: int | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM assets WHERE status = 'failed' ORDER BY updated_at DESC"
+        if limit is not None:
+            return self._conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+        return self._conn.execute(sql).fetchall()
 
     # --- meta ----------------------------------------------------------------
 
@@ -197,4 +223,4 @@ class StateStore:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
-        self._conn.commit()
+        self.flush()  # meta writes mark pass boundaries — persist everything

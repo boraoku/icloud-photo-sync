@@ -251,10 +251,13 @@ def status(ctx: typer.Context) -> None:
         typer.echo(f"Last full pass : {last_full or 'never'}")
         typer.echo(f"Last update    : {last_update or 'never'}")
 
-        failed = state.iter_failed()
-        if failed:
-            typer.secho(f"\nFailed assets (retried on next sync) — showing up to 10:", fg=typer.colors.RED)
-            for row in failed[:10]:
+        if counts["failed"]:
+            typer.secho(
+                f"\nFailed assets (retried on next sync) — showing "
+                f"{min(counts['failed'], 10)} of {counts['failed']}:",
+                fg=typer.colors.RED,
+            )
+            for row in state.iter_failed(limit=10):
                 typer.echo(f"  {row['filename']}: {row['error']}")
     finally:
         state.close()

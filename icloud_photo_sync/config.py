@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import keyring
@@ -80,8 +80,6 @@ class AppConfig:
     verbose: bool = False
     show_progress: bool = True
 
-    extra: dict = field(default_factory=dict)
-
     @classmethod
     def create(
         cls,
@@ -111,7 +109,11 @@ class AppConfig:
             logs_dir=logs_dir,
         )
         for k, v in overrides.items():
-            if v is not None and hasattr(cfg, k):
+            if not hasattr(cfg, k):
+                # A silently-dropped typo would run with defaults and be
+                # near-impossible to debug; fail loudly instead.
+                raise TypeError(f"unknown config override: {k!r}")
+            if v is not None:
                 setattr(cfg, k, v)
         return cfg
 

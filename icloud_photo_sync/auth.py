@@ -20,7 +20,6 @@ from .errors import (
     TwoFactorRequiredError,
 )
 from .logutil import get_logger
-from .models import AssetRef  # noqa: F401  (re-exported convenience)
 
 logger = get_logger(__name__)
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from threading import Event
 
 import requests
+from tqdm import tqdm
 
 from .config import AppConfig, PARTIAL_FLUSH_BYTES, PARTIAL_FLUSH_SECS
 from .errors import (
@@ -64,7 +65,9 @@ class Downloader:
         if abs_dest.exists():
             actual = abs_dest.stat().st_size
             if expected is not None and actual == expected:
-                self.state.mark_completed(asset.id, actual)
+                # Only write when the row isn't already in this exact state.
+                if row is None or row["status"] != "completed" or row["bytes_done"] != actual:
+                    self.state.mark_completed(asset.id, actual)
                 return DownloadOutcome.SKIPPED
             if (
                 row is not None
@@ -160,6 +163,7 @@ class Downloader:
                         f.flush()
                         os.fsync(f.fileno())
                         self.state.record_partial(asset.id, have)
+                        self.state.flush()  # commits are batched; persist the stop point
                         raise OperationCancelled()
                     if not chunk:
                         continue
@@ -183,7 +187,8 @@ class Downloader:
                 pass
             if bar is not None:
                 bar.close()
-        self.state.record_partial(asset.id, have)
+        # No trailing record_partial: the caller immediately verifies and
+        # either marks completed or restarts, superseding it.
         return have
 
     @staticmethod
@@ -217,9 +222,11 @@ class Downloader:
     def _make_bar(self, asset: AssetRef, have: int, total: int | None):
         if not self.config.show_progress or not sys.stderr.isatty():
             return None
+        # A bar for a file that arrives in one chunk is pure flicker/overhead;
+        # only show one for transfers spanning multiple chunks (videos, RAWs).
+        if total is not None and total <= self.config.chunk_size:
+            return None
         try:
-            from tqdm import tqdm
-
             desc = asset.filename if len(asset.filename) <= 28 else asset.filename[:25] + "…"
             return tqdm(
                 total=total,

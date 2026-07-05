@@ -38,9 +38,12 @@ class AssetRef:
 
 
 class DownloadOutcome(str, Enum):
-    """Result of attempting to download a single asset."""
+    """Result of attempting to download a single asset.
+
+    Cancellation is not an outcome: it raises ``OperationCancelled`` so it
+    can cut through the retry loop and the orchestrator uniformly.
+    """
 
     SKIPPED = "skipped"      # already complete on disk
     DOWNLOADED = "downloaded"
     FAILED = "failed"        # gave up after retries; recorded for next run
-    CANCELLED = "cancelled"  # user stopped mid-transfer
