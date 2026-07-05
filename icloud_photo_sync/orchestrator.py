@@ -11,7 +11,7 @@ download. Three behaviours, all one-way (download/add only, never delete):
 
 from __future__ import annotations
 
-import time
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +19,12 @@ from threading import Event
 
 from .config import AppConfig
 from .downloader import Downloader
-from .errors import OperationCancelled, SessionExpiredError, TransientError
+from .errors import (
+    LibraryIndexingError,
+    OperationCancelled,
+    SessionExpiredError,
+    TransientError,
+)
 from .icloud_client import ICloudClient
 from .logutil import get_logger
 from .models import AssetRef, DownloadOutcome
@@ -103,20 +108,39 @@ class Orchestrator:
     def run_incremental(self, until_found: int | None = None) -> RunStats:
         until_found = until_found or self.config.until_found
         stats = RunStats()
-        logger.info("Starting incremental pass (stop after %d consecutive seen).", until_found)
+        # Early-stop is only sound over a newest-ADDED-first ordering: brand-new
+        # additions must come first even when their capture date is old
+        # (imports/AirDrops/scans). The capture-date-ordered "All Photos" album
+        # would bury those, so if the added-date listing is unavailable we scan
+        # everything rather than silently miss photos.
+        assets = self.client.iter_added_desc()
+        early_stop = assets is not None
+        if early_stop:
+            logger.info(
+                "Starting incremental pass (stop after %d consecutive seen).", until_found
+            )
+        else:
+            logger.warning(
+                "Added-date listing unavailable; scanning the full library "
+                "for new items (no early stop — this is slower but safe)."
+            )
+            assets = self.client.iter_all_assets()
         consecutive = 0
         seen = 0
         try:
-            for asset in self.client.iter_all_assets():
+            for asset in assets:
                 self._raise_if_cancelled()
                 row = self.state.get(asset.id)
                 if row is not None and row["status"] == "completed" and self._on_disk_ok(asset, row):
                     stats.skipped += 1
-                    consecutive += 1
-                    if consecutive >= until_found:
-                        stats.stopped_early = True
-                        logger.info("Hit %d consecutive already-have assets; stopping.", until_found)
-                        break
+                    if early_stop:
+                        consecutive += 1
+                        if consecutive >= until_found:
+                            stats.stopped_early = True
+                            logger.info(
+                                "Hit %d consecutive already-have assets; stopping.", until_found
+                            )
+                            break
                     continue
                 consecutive = 0
                 stats.add(self._process(asset))
@@ -139,8 +163,9 @@ class Orchestrator:
                 return
             except OperationCancelled:
                 break
-            except TransientError as exc:
-                logger.warning("Pass failed transiently (%s); will retry next interval.", exc)
+            except (TransientError, LibraryIndexingError) as exc:
+                # Both are Apple-side temporary conditions — ride them out.
+                logger.warning("Pass failed (%s); will retry next interval.", exc)
             if self.cancel.is_set():
                 break
             logger.info("Sleeping %ds until next pass…", interval)
@@ -163,15 +188,71 @@ class Orchestrator:
         return outcome
 
     def _resolve_dest(self, asset: AssetRef) -> Path:
-        """Compute (or reuse) a stable relative destination and record it."""
+        """Compute (or reuse) a stable relative destination and record it.
+
+        Policy (one-way guarantee — we never overwrite an existing file):
+        * A recorded destination is reused; but if a file we never finalized
+          now occupies it and its size doesn't match, the asset is re-pointed
+          to a suffixed name (any in-progress ``.part`` moves along with it).
+        * With no state row, an existing file at the canonical path whose size
+          matches iCloud's is **adopted** as already-downloaded (recovers a
+          lost DB / pre-populated folder without re-downloading terabytes);
+          any other existing file is treated as a collision and suffixed.
+        """
         row = self.state.get(asset.id)
+        expected = asset.size
+        if expected is None and row is not None:
+            expected = row["expected_size"]
+
         if row is not None and row["dest_path"]:
             rel = Path(row["dest_path"])
-        else:
-            rel = self.paths.relative_dest(asset)
-            rel = self.paths.disambiguate(rel, self._taken_predicate(asset.id))
+            abs_dest = self.paths.absolute(rel)
+            if (
+                row["status"] != "completed"
+                and abs_dest.exists()
+                and (expected is None or abs_dest.stat().st_size != expected)
+            ):
+                # We never finalized this path, yet a non-matching file sits
+                # there (e.g. the user's own). Leave it alone and move aside.
+                # The occupied path counts as taken even though we own its row.
+                base_taken = self._taken_predicate(asset.id)
+                new_rel = self.paths.disambiguate(
+                    self.paths.relative_dest(asset),
+                    lambda p: p == rel or base_taken(p),
+                )
+                logger.warning(
+                    "Destination %s is occupied by a file we did not write; using %s",
+                    rel.as_posix(), new_rel.as_posix(),
+                )
+                self._move_part(rel, new_rel)
+                self.state.register(asset, new_rel.as_posix())
+                self.state.update_dest(asset.id, new_rel.as_posix())
+                return new_rel
+            self.state.register(asset, rel.as_posix())
+            return rel
+
+        rel = self.paths.relative_dest(asset)
+        abs_dest = self.paths.absolute(rel)
+        if abs_dest.exists() and expected is not None and abs_dest.stat().st_size == expected:
+            logger.info("Adopting existing file %s (size matches iCloud).", rel.as_posix())
+            self.state.register(asset, rel.as_posix())
+            self.state.mark_completed(asset.id, expected)
+            return rel
+        rel = self.paths.disambiguate(rel, self._taken_predicate(asset.id))
         self.state.register(asset, rel.as_posix())
         return rel
+
+    def _move_part(self, old_rel: Path, new_rel: Path) -> None:
+        """Carry partial progress along when an asset is re-pointed."""
+        old_part = self.paths.absolute(old_rel).with_name(old_rel.name + ".part")
+        if not old_part.exists():
+            return
+        new_part = self.paths.absolute(new_rel).with_name(new_rel.name + ".part")
+        try:
+            new_part.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old_part, new_part)
+        except OSError:
+            old_part.unlink(missing_ok=True)  # .part files are ours to discard
 
     def _taken_predicate(self, self_id: str):
         def taken(rel: Path) -> bool:
@@ -189,9 +270,12 @@ class Orchestrator:
         abs_dest = self.paths.absolute(Path(row["dest_path"])) if row["dest_path"] else None
         if abs_dest is None or not abs_dest.exists():
             return False
-        if asset.size is None:
+        # Fall back to the manifest's recorded size when iCloud transiently
+        # doesn't report one — never let a size hiccup bless a truncated file.
+        expected = asset.size if asset.size is not None else row["expected_size"]
+        if expected is None:
             return True
-        return abs_dest.stat().st_size == asset.size
+        return abs_dest.stat().st_size == expected
 
     # -- helpers --------------------------------------------------------------
 
@@ -205,6 +289,5 @@ class Orchestrator:
             raise OperationCancelled()
 
     def _interruptible_sleep(self, seconds: float) -> None:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline and not self.cancel.is_set():
-            time.sleep(min(1.0, deadline - time.monotonic()))
+        # Event.wait wakes immediately on cancel (plain sleep would not — PEP 475).
+        self.cancel.wait(seconds)

@@ -67,7 +67,11 @@ icloud-photo-sync status
 ```
 
 The password is stored in the **macOS Keychain** (never on the command line).
-You are asked once during `login`; clear it with `--reset-keyring`.
+You are asked once during `login`; clear it with `--reset-keyring` (this also
+clears the entry pyicloud itself keeps under `pyicloud://icloud-password`, which
+it would otherwise silently fall back to). If a saved password stops working —
+e.g. after an Apple ID password change — `login` prompts you again instead of
+failing.
 
 ---
 
@@ -114,14 +118,24 @@ Exit codes: `2` = account precondition problem, `3` = session expired (run
   resumes partial files.
 * **Interrupted transfers.** Files stream to a `*.part` sibling. On retry the
   tool sends an HTTP `Range` request to **resume** from where it left off; if the
-  server won't honour the range it **restarts that file**. The final size is
-  verified against iCloud's, then the file is atomically renamed into place — a
-  half-written file is never mistaken for complete.
-* **Incremental / watch.** New items appear at the top of “All Photos”
-  (newest-first). An incremental pass walks from the top and stops once it sees a
-  run of items it already has.
+  server won't honour the range (or answers with a mismatched offset) it
+  **restarts that file**. The final size is verified against iCloud's reported
+  size — or, when that is unavailable, against the size the content server
+  advertised — then the file is atomically renamed into place. A half-written
+  file is never mistaken for complete.
+* **Incremental / watch.** Incremental passes enumerate by the date an item was
+  **added to iCloud** (newest first), so imports and AirDrops of old photos are
+  found too, and stop once they see a run of items already downloaded. If the
+  added-date listing is ever unavailable, the pass falls back to scanning the
+  whole library rather than risk missing anything.
 * **One-way.** No deletion, no two-way reconciliation. If you remove a photo from
-  iCloud, your local copy stays.
+  iCloud, your local copy stays. The tool also **never overwrites** a file it
+  didn't write: if an unknown file occupies a destination, the download is
+  redirected to a `-1`-suffixed name (or refused, with the reason recorded).
+* **Existing exports are adopted.** If a file already sits at the expected
+  `YYYY/MM/name` with exactly the size iCloud reports (e.g. you re-point the tool
+  at an old export, or the manifest was lost), it is marked complete instead of
+  being downloaded again.
 
 ### Where things live
 

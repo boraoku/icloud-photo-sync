@@ -88,6 +88,10 @@ def _build_config(ctx: typer.Context, **overrides) -> AppConfig:
             typer.secho(f"Cleared stored password for {apple_id}.", fg=typer.colors.YELLOW)
         else:
             typer.secho("No stored password to clear.", fg=typer.colors.YELLOW)
+        # pyicloud keeps its own keychain entry and silently falls back to it;
+        # clear that too or a stale password keeps being replayed at Apple.
+        if ic.clear_engine_credentials(apple_id):
+            typer.secho("Cleared pyicloud's keychain entry as well.", fg=typer.colors.YELLOW)
     return config
 
 
@@ -134,15 +138,31 @@ def login(ctx: typer.Context) -> None:
     def code_provider(prompt: str) -> str:
         return typer.prompt(prompt)
 
-    try:
-        service, client = sm.login(password, code_provider)
-        sm.verify_access(client)
-    except AccountPreconditionError as exc:
-        _fail(str(exc), 2)
-    except AcceptTermsError as exc:
-        _fail(str(exc), 4)
-    except ICloudSyncError as exc:
-        _fail(f"Login failed: {exc}", 1)
+    retried = False
+    while True:
+        try:
+            service, client = sm.login(password, code_provider)
+            sm.verify_access(client)
+            break
+        except AccountPreconditionError as exc:
+            _fail(str(exc), 2)
+        except AcceptTermsError as exc:
+            _fail(str(exc), 4)
+        except ICloudSyncError as exc:
+            # A saved Keychain password may be stale (Apple ID password was
+            # changed): re-prompt once instead of failing into a dead end.
+            if had_saved and not retried:
+                retried = True
+                had_saved = False
+                typer.secho(
+                    f"Login with the saved Keychain password failed: {exc}",
+                    fg=typer.colors.YELLOW,
+                )
+                password = typer.prompt(
+                    f"iCloud password for {config.apple_id}", hide_input=True
+                )
+                continue
+            _fail(f"Login failed: {exc}", 1)
 
     if not had_saved:
         if typer.confirm("Save password to the macOS Keychain for future runs?", default=True):
@@ -187,6 +207,7 @@ def sync(
     paths = PathResolver(config.output_root)
     cancel = Event()
     _install_signal_handlers(cancel)
+    client.set_cancel_event(cancel)  # makes the indexing wait Ctrl-C-able
     downloader = Downloader(client, state, config, cancel)
     orch = Orchestrator(client, state, paths, downloader, config, cancel)
 

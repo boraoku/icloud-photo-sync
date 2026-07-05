@@ -6,33 +6,60 @@ Everything else depends on this thin interface so the engine can be swapped
 Verified against pyicloud 2.6.5 (CloudKit backend). Notable facts this code
 relies on, established by reading the installed source:
 
-* ``api.photos.all`` is the "All Photos" smart album, sorted **newest-first**
-  (``DirectionEnum.DESCENDING``) — required for the incremental early-stop.
+* ``PyiCloudSession.request`` (and therefore ``session.get``) normalizes every
+  non-2xx response — and every connection error — into
+  ``PyiCloudAPIResponseException`` via ``raise_for_status``. Raw status codes
+  are only observable through ``session.request_raw``, which skips the
+  normalization but still persists cookies. Asset downloads therefore go
+  through ``request_raw`` so byte-range / signed-URL-expiry handling can see
+  the actual 200/206/403/416/503.
+* ``api.photos.all`` is sorted newest-first **by capture date**
+  (``CPLAssetAndMasterByAssetDate…``), NOT by the date an asset was added to
+  iCloud. Incremental early-stop therefore uses a separate album built on
+  ``ListTypeEnum.ADDED`` (``CPLAssetAndMasterByAddedDate``, descending), which
+  pyicloud supports natively via ``_iter_added_desc_photos``.
 * ``PhotoAsset.download()`` reads the entire body into memory in this version,
-  so it is **not** used. Instead we stream ``api.session.get(url, stream=True)``
-  against ``asset.download_url('original')`` — byte-for-byte the same auth path
-  pyicloud's own ``_CloudKitHTTP.get_stream`` uses, but with a ``Range`` header
-  so large videos can resume.
+  so it is **not** used; we stream ``request_raw`` against
+  ``asset.download_url('original')`` with a ``Range`` header instead.
 * ``asset.created`` == ``asset.asset_date`` (capture time, UTC-aware). Missing
   dates come back as the Unix epoch sentinel, which we treat as ``None``.
 * ``asset._refresh_from_library()`` re-fetches the asset's records (fresh signed
   URLs) but does not clear the cached ``_resources``; we reset that ourselves.
+* ``PyiCloudServiceNotActivatedException`` is raised both for a library that is
+  still indexing AND for a missing ``ckdatabasews`` webservice ("Webservice not
+  available"), which is the Advanced-Data-Protection / web-access-off symptom —
+  the two must be told apart by message.
 """
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
+from threading import Event
 from typing import Iterator
 
 import requests
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
+    PyiCloud2FARequiredException,
+    PyiCloud2SARequiredException,
     PyiCloudAcceptTermsException,
     PyiCloudAPIResponseException,
+    PyiCloudAuthRequiredException,
+    PyiCloudException,
     PyiCloudFailedLoginException,
     PyiCloudServiceNotActivatedException,
+    PyiCloudServiceUnavailable,
 )
+from pyicloud.services.photos import (
+    DirectionEnum,
+    ListTypeEnum,
+    ObjectTypeEnum,
+    SmartAlbumEnum,
+    SmartPhotoAlbum,
+)
+from pyicloud.utils import delete_password_in_keyring
 
 from .config import AppConfig
 from .errors import (
@@ -42,7 +69,9 @@ from .errors import (
     DownloadError,
     ICloudSyncError,
     LibraryIndexingError,
+    OperationCancelled,
     ServiceUnavailableError,
+    SessionExpiredError,
     TransientError,
 )
 from .logutil import get_logger
@@ -61,36 +90,84 @@ PRECONDITION_REMEDIATION = (
     "security key as the only factor is not supported."
 )
 
+SESSION_EXPIRED_GUIDANCE = (
+    "iCloud session expired or re-authentication is required.\n"
+    "Run:  icloud-photo-sync login"
+)
 
-def _looks_like_access_denied(exc: PyiCloudAPIResponseException) -> bool:
-    blob = f"{getattr(exc, 'reason', '')} {getattr(exc, 'code', '')}".upper()
-    return "ACCESS_DENIED" in blob or "ACCESS DENIED" in blob
+# Apple status codes pyicloud surfaces for an expired/re-auth-required session.
+_AUTH_REQUIRED_CODES = {421, 450}
+_TRANSIENT_CODES = {429, 500, 502, 503, 504}
+
+_CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-")
+
+
+def _exc_text(exc: Exception) -> str:
+    return f"{getattr(exc, 'reason', '')} {getattr(exc, 'code', '')} {exc}".lower()
+
+
+def _exc_code(exc: Exception) -> int | None:
+    try:
+        return int(getattr(exc, "code", None))
+    except (TypeError, ValueError):
+        return None
 
 
 def map_api_error(exc: Exception) -> ICloudSyncError:
-    """Translate a pyicloud exception into one of ours."""
+    """Translate any pyicloud exception into one of ours.
+
+    The classification drives real behaviour downstream: ``TransientError`` is
+    retried, ``SessionExpiredError`` stops with "run login" guidance,
+    ``LibraryIndexingError`` is waited out, ``AccountPreconditionError`` prints
+    remediation. Everything unknown becomes a plain ``ICloudSyncError``.
+    """
     if isinstance(exc, PyiCloudServiceNotActivatedException):
+        # Same exception type for "still indexing" and "webservice missing"
+        # (the ADP / web-access-off symptom); only the message differs.
+        if "not available" in _exc_text(exc):
+            return AccountPreconditionError(PRECONDITION_REMEDIATION)
         return LibraryIndexingError(str(exc))
     if isinstance(exc, PyiCloudAcceptTermsException):
         return AcceptTermsError(
             "Apple requires accepting updated iCloud terms & conditions. Sign in "
             "at https://www.icloud.com to accept them, then re-run."
         )
+    if isinstance(
+        exc,
+        (
+            PyiCloud2FARequiredException,
+            PyiCloud2SARequiredException,
+            PyiCloudAuthRequiredException,
+        ),
+    ):
+        return SessionExpiredError(SESSION_EXPIRED_GUIDANCE)
     if isinstance(exc, PyiCloudFailedLoginException):
         return AuthenticationError(f"Login failed: {exc}")
+    if isinstance(exc, PyiCloudServiceUnavailable):
+        return ServiceUnavailableError(str(exc))
     if isinstance(exc, PyiCloudAPIResponseException):
-        if _looks_like_access_denied(exc):
+        text = _exc_text(exc)
+        code = _exc_code(exc)
+        if "access_denied" in text or "access denied" in text:
             return AccountPreconditionError(PRECONDITION_REMEDIATION)
+        if code in _AUTH_REQUIRED_CODES or "authentication required" in text:
+            return SessionExpiredError(SESSION_EXPIRED_GUIDANCE)
+        if code in _TRANSIENT_CODES or "temporarily unavailable" in text:
+            return ServiceUnavailableError(f"iCloud temporarily unavailable: {exc}")
         return ICloudSyncError(f"iCloud API error: {exc}")
     return ICloudSyncError(str(exc))
 
 
 def _dt_or_none(dt: datetime | None) -> datetime | None:
-    """pyicloud returns the Unix epoch for missing dates; treat that as unknown."""
+    """pyicloud returns the Unix epoch (exactly 0) for missing dates.
+
+    Only that sentinel is treated as unknown — genuinely pre-1970 capture
+    dates (negative timestamps; scanned photos) are kept.
+    """
     if dt is None:
         return None
     try:
-        if int(dt.timestamp()) <= 0:
+        if int(dt.timestamp()) == 0:
             return None
     except (OverflowError, OSError, ValueError):
         return None
@@ -115,8 +192,7 @@ def create_service(
             cookie_directory=str(cookie_dir),
             accept_terms=accept_terms,
         )
-    except (PyiCloudFailedLoginException, PyiCloudAPIResponseException,
-            PyiCloudAcceptTermsException) as exc:
+    except PyiCloudException as exc:
         raise map_api_error(exc) from exc
 
 
@@ -169,33 +245,63 @@ def account_name(service: PyiCloudService) -> str:
     return getattr(service, "account_name", "") or ""
 
 
+def clear_engine_credentials(apple_id: str) -> bool:
+    """Clear pyicloud's OWN keychain entry (service ``pyicloud://icloud-password``).
+
+    pyicloud silently falls back to that entry when no password is given, so
+    ``--reset-keyring`` must clear it too or a stale password stored by another
+    pyicloud-based tool keeps being replayed against Apple.
+    """
+    try:
+        delete_password_in_keyring(apple_id)
+        return True
+    except Exception:  # noqa: BLE001 - absent entry / locked keychain
+        return False
+
+
 # --- The client --------------------------------------------------------------
 
 
 class ICloudClient:
     """Enumeration + streaming download over an authenticated session."""
 
-    def __init__(self, service: PyiCloudService, config: AppConfig) -> None:
+    def __init__(
+        self,
+        service: PyiCloudService,
+        config: AppConfig,
+        cancel_event: Event | None = None,
+    ) -> None:
         self._service = service
         self._config = config
+        self._cancel = cancel_event or Event()
+
+    def set_cancel_event(self, event: Event) -> None:
+        self._cancel = event
+
+    def _wait(self, seconds: float) -> None:
+        """Cancellation-aware sleep; raises OperationCancelled when stopped."""
+        if self._cancel.wait(seconds):
+            raise OperationCancelled()
 
     # -- enumeration ----------------------------------------------------------
 
     def _all_album(self):
         """Return the 'All Photos' album, waiting out library indexing.
 
-        Accessing ``.photos.all`` is lazy — the not-activated error and any
-        ``ACCESS_DENIED`` precondition only surface when a query runs. We force
-        that here with ``len()`` so the indexing wait and precondition detection
-        happen up front rather than mid-enumeration.
+        Accessing ``.photos.all`` is lazy — errors only surface when a query
+        runs. We force that here with ``len()`` so the indexing wait and
+        precondition detection happen up front rather than mid-enumeration.
         """
         deadline = time.monotonic() + self._config.indexing_max_wait
         while True:
             try:
                 album = self._service.photos.all
-                len(album)  # trigger activation / surface ACCESS_DENIED + indexing
+                len(album)  # trigger activation / surface errors
                 return album
-            except PyiCloudServiceNotActivatedException as exc:
+            except PyiCloudException as exc:
+                mapped = map_api_error(exc)
+                if not isinstance(mapped, LibraryIndexingError):
+                    raise mapped from exc
                 if time.monotonic() >= deadline:
                     raise LibraryIndexingError(
                         "iCloud is still indexing the photo library; gave up "
@@ -205,9 +311,7 @@ class ICloudClient:
                     "iCloud library still indexing; retrying in %.0fs…",
                     self._config.indexing_retry,
                 )
-                time.sleep(self._config.indexing_retry)
-            except PyiCloudAPIResponseException as exc:
-                raise map_api_error(exc) from exc
+                self._wait(self._config.indexing_retry)
             except requests.exceptions.RequestException as exc:
                 raise TransientError(f"connection error reaching iCloud: {exc}") from exc
 
@@ -217,33 +321,66 @@ class ICloudClient:
             return len(self._all_album())
         except ICloudSyncError:
             raise
+        except PyiCloudException as exc:
+            raise map_api_error(exc) from exc
         except Exception:  # noqa: BLE001 - count is optional
             return None
 
     def iter_all_assets(self) -> Iterator[AssetRef]:
-        """Yield every asset in 'All Photos', newest-first."""
-        album = self._all_album()
+        """Yield every asset in 'All Photos', newest-capture-first."""
+        return self._iter_album(self._all_album())
+
+    def iter_added_desc(self) -> Iterator[AssetRef] | None:
+        """Yield assets newest-ADDED-first, or None if unavailable.
+
+        This is the ordering the incremental early-stop needs: brand-new
+        additions come first even when their capture date is old (imports,
+        AirDrops, scans). Returns None when the added-date album cannot be
+        built (engine change); callers must then fall back to a full scan
+        WITHOUT early-stop, or new-but-old photos would be missed silently.
+        """
+        self._all_album()  # surface indexing/precondition errors first
+        try:
+            photos = self._service.photos
+            library = getattr(photos, "_root_library", None)
+            if library is None:
+                logger.warning("pyicloud exposes no _root_library; added-date listing unavailable.")
+                return None
+            album = SmartPhotoAlbum(
+                library=library,
+                name=SmartAlbumEnum.ALL_PHOTOS,
+                obj_type=ObjectTypeEnum.ALL,
+                list_type=ListTypeEnum.ADDED,
+                direction=DirectionEnum.DESCENDING,
+                client=getattr(library, "_client", None),
+                zone_id=library.zone_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - engine drift → honest fallback
+            logger.warning("Could not build added-date album (%s); falling back.", exc)
+            return None
+        return self._iter_album(album)
+
+    def _iter_album(self, album) -> Iterator[AssetRef]:
         try:
             for raw in album:
                 yield self._build_asset_ref(raw)
-        except PyiCloudServiceNotActivatedException as exc:
-            raise LibraryIndexingError(str(exc)) from exc
-        except PyiCloudAPIResponseException as exc:
+        except PyiCloudException as exc:
             raise map_api_error(exc) from exc
         except requests.exceptions.RequestException as exc:
             raise TransientError(f"Enumeration interrupted: {exc}") from exc
 
     def _build_asset_ref(self, raw) -> AssetRef:
-        size = None
+        # PhotoAsset.size is a single record-field read; .versions would
+        # materialize every rendition, so it is only a fallback.
         try:
-            original = raw.versions.get("original")
-            if original:
-                size = original.get("size")
+            size = raw.size
         except Exception:  # noqa: BLE001
-            original = None
+            size = None
         if size is None:
             try:
-                size = raw.size
+                original = raw.versions.get("original")
+                if original:
+                    size = original.get("size")
             except Exception:  # noqa: BLE001
                 size = None
         return AssetRef(
@@ -286,6 +423,30 @@ class ICloudClient:
             raise DownloadError(f"no 'original' download URL for {asset.filename}")
         return url
 
+    def _get_raw(self, url: str, headers: dict | None):
+        """Streaming GET that sees real status codes.
+
+        ``session.get`` normalizes every non-2xx into
+        ``PyiCloudAPIResponseException`` (see module docstring), which would
+        make all status handling below unreachable — so use ``request_raw``
+        when the session provides it. ``request_raw`` still wraps connection
+        errors in ``PyiCloudAPIResponseException``; both flavours map to
+        ``TransientError`` here because a CDN GET has no API-error meaning.
+        """
+        session = self._service.session
+        kwargs = dict(headers=headers or None, stream=True, timeout=self._config.timeout)
+        try:
+            if hasattr(session, "request_raw"):
+                return session.request_raw("GET", url, **kwargs)
+            return session.get(url, **kwargs)
+        except (requests.exceptions.RequestException, PyiCloudAPIResponseException) as exc:
+            raise TransientError(f"connection error: {exc}") from exc
+
+    @staticmethod
+    def _content_range_start(resp) -> int | None:
+        m = _CONTENT_RANGE_RE.match(resp.headers.get("Content-Range", ""))
+        return int(m.group(1)) if m else None
+
     @staticmethod
     def _total_size(resp, byte_offset: int, status: int) -> int | None:
         if status == 206:
@@ -303,23 +464,16 @@ class ICloudClient:
         """Open a streaming GET for the original.
 
         Returns ``(response, range_ok, total_size)``. ``range_ok`` is True only
-        when a non-zero offset was honoured (HTTP 206); when False the response
-        body starts from byte 0 and the caller must restart the file. The
-        response is always positioned to be read from where the caller will
-        continue writing (offset if range_ok else 0).
+        when a non-zero offset was honoured (HTTP 206 whose Content-Range start
+        matches the requested offset); when False the response body starts from
+        byte 0 and the caller must restart the file.
         """
         url = self._original_url(asset)
         headers = {}
         if byte_offset > 0:
             headers["Range"] = f"bytes={byte_offset}-"
 
-        try:
-            resp = self._service.session.get(
-                url, stream=True, headers=headers, timeout=self._config.timeout
-            )
-        except requests.exceptions.RequestException as exc:
-            raise TransientError(f"connection error: {exc}") from exc
-
+        resp = self._get_raw(url, headers)
         status = resp.status_code
 
         # Expired/forbidden signed URL → refresh once and retry.
@@ -327,13 +481,7 @@ class ICloudClient:
             resp.close()
             if self.refresh_asset(asset):
                 url = self._original_url(asset, allow_refresh=False)
-                try:
-                    resp = self._service.session.get(
-                        url, stream=True, headers=headers,
-                        timeout=self._config.timeout,
-                    )
-                except requests.exceptions.RequestException as exc:
-                    raise TransientError(f"connection error: {exc}") from exc
+                resp = self._get_raw(url, headers)
                 status = resp.status_code
 
         if status == 503:
@@ -347,9 +495,18 @@ class ICloudClient:
 
         if status not in (200, 206):
             resp.close()
-            if status in (429, 500, 502, 504):
+            if status in _TRANSIENT_CODES:
                 raise TransientError(f"HTTP {status} from iCloud")
             raise DownloadError(f"unexpected HTTP {status} downloading {asset.filename}")
+
+        if byte_offset > 0 and status == 206:
+            start = self._content_range_start(resp)
+            if start != byte_offset:
+                # Server honoured *a* range, but not ours (or sent no/garbled
+                # Content-Range). Appending this body would corrupt the file —
+                # restart from zero instead.
+                resp.close()
+                return self.open_stream(asset, byte_offset=0)
 
         range_ok = byte_offset > 0 and status == 206
         total = self._total_size(resp, byte_offset, status)

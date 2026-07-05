@@ -53,19 +53,35 @@ class Downloader:
     # -- public ---------------------------------------------------------------
 
     def download(self, asset: AssetRef, abs_dest: Path) -> DownloadOutcome:
+        row = self.state.get(asset.id)
         expected = asset.size
+        if expected is None and row is not None:
+            expected = row["expected_size"]
         part = abs_dest.with_name(abs_dest.name + ".part")
 
-        # Already complete on disk? (correct size, or unknown size → trust it).
+        # A file already at the destination is either ours (skip) or unknown
+        # (refuse). One-way guarantee: never overwrite an existing final file.
         if abs_dest.exists():
             actual = abs_dest.stat().st_size
-            if expected is None or actual == expected:
+            if expected is not None and actual == expected:
                 self.state.mark_completed(asset.id, actual)
                 return DownloadOutcome.SKIPPED
-            logger.debug(
-                "%s exists but is %d bytes (expected %d); re-downloading",
-                abs_dest.name, actual, expected,
+            if (
+                row is not None
+                and row["status"] == "completed"
+                and row["bytes_done"]
+                and actual == row["bytes_done"]
+            ):
+                # Verified by an earlier run; size metadata is unavailable now.
+                return DownloadOutcome.SKIPPED
+            msg = (
+                f"refusing to overwrite existing file {abs_dest} (size {actual}, "
+                f"expected {expected if expected is not None else 'unknown'}); "
+                "remove or rename it to re-download this asset"
             )
+            logger.error("%s", msg)
+            self.state.mark_failed(asset.id, msg)
+            return DownloadOutcome.FAILED
 
         abs_dest.parent.mkdir(parents=True, exist_ok=True)
         have = part.stat().st_size if part.exists() else 0
@@ -84,12 +100,20 @@ class Downloader:
                 have = self._stream_to_part(resp, part, mode, have, asset, total or expected)
 
                 final_size = part.stat().st_size
-                if expected is not None and final_size != expected:
+                # Verify against iCloud's reported size, falling back to the
+                # size the content server itself advertised for this transfer.
+                check = expected if expected is not None else total
+                if check is not None and final_size != check:
                     raise IntegrityError(
                         f"size mismatch for {asset.filename}: got {final_size}, "
-                        f"expected {expected}"
+                        f"expected {check}"
                     )
 
+                if abs_dest.exists():
+                    raise DownloadError(
+                        f"refusing to overwrite {abs_dest}: a file appeared there "
+                        "during the download"
+                    )
                 self._finalize(part, abs_dest)
                 self.state.mark_completed(asset.id, final_size)
                 return DownloadOutcome.DOWNLOADED
@@ -181,10 +205,10 @@ class Downloader:
         return base * (0.5 + random.random() * 0.5)  # 50–100% jitter
 
     def _interruptible_sleep(self, seconds: float) -> None:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            self._raise_if_cancelled()
-            time.sleep(min(0.25, deadline - time.monotonic()))
+        # Event.wait wakes immediately when the signal handler sets the event
+        # (a plain time.sleep would run to completion — PEP 475).
+        if self.cancel.wait(seconds):
+            raise OperationCancelled()
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel.is_set():

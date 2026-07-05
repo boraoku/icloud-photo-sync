@@ -88,3 +88,22 @@ def test_meta_roundtrip(store):
     store.set_meta("last_full_pass_at", "2026-06-28T00:00:00+00:00")
     assert store.get_meta("last_full_pass_at") == "2026-06-28T00:00:00+00:00"
     assert store.get_meta("schema_version") == "1"
+
+
+def test_register_null_metadata_does_not_clobber(store):
+    """A later enumeration that fails to read size/dates must never erase
+    known-good values — the stored size is the integrity ground truth."""
+    store.register(_asset(size=100), "p")
+    degraded = AssetRef(id="a1", filename="IMG.HEIC", capture_dt=None,
+                        added_dt=None, size=None)
+    store.register(degraded, "ignored")
+    row = store.get("a1")
+    assert row["expected_size"] == 100
+    assert row["capture_dt"] is not None
+    assert row["added_dt"] is not None
+
+
+def test_update_dest(store):
+    store.register(_asset(), "old/path.HEIC")
+    store.update_dest("a1", "new/path.HEIC")
+    assert store.get("a1")["dest_path"] == "new/path.HEIC"

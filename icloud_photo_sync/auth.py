@@ -34,9 +34,24 @@ class SessionManager:
     # -- non-interactive resume (used by `sync` / `status`) -------------------
 
     def resume(self) -> tuple[object, ic.ICloudClient]:
-        """Reuse the persisted session. Raise if a fresh login is required."""
+        """Reuse the persisted session. Raise SessionExpiredError otherwise.
+
+        Every authentication-shaped failure here (no stored password, expired
+        cookies, rejected token) means the same thing to the user: run `login`.
+        Mapping them all to SessionExpiredError keeps the CLI's exit-code and
+        guidance contract intact.
+        """
         password = self._stored_password()
-        service = ic.create_service(self.config.apple_id, password, self.config.cookie_dir)
+        try:
+            service = ic.create_service(
+                self.config.apple_id, password, self.config.cookie_dir
+            )
+        except SessionExpiredError:
+            raise
+        except AuthenticationError as exc:
+            raise SessionExpiredError(
+                f"No valid iCloud session ({exc}).\nRun:  icloud-photo-sync login"
+            ) from exc
         if ic.requires_2fa(service) or ic.requires_2sa(service):
             raise SessionExpiredError(
                 "iCloud session expired or two-factor authentication is required.\n"

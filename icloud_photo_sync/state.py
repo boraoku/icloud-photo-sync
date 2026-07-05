@@ -90,7 +90,10 @@ class StateStore:
 
         ``dest_path``, ``bytes_done``, ``status`` and ``error`` are preserved on
         conflict so an asset never changes destination and progress is never
-        reset just because we re-enumerated it.
+        reset just because we re-enumerated it. ``expected_size``, ``capture_dt``
+        and ``added_dt`` are COALESCEd: a later enumeration that transiently
+        fails to read them (NULL) must never erase known-good values — the
+        stored size is the integrity ground truth for files on disk.
         """
         self._conn.execute(
             """
@@ -100,9 +103,9 @@ class StateStore:
             VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?)
             ON CONFLICT(id) DO UPDATE SET
                 filename      = excluded.filename,
-                capture_dt    = excluded.capture_dt,
-                added_dt      = excluded.added_dt,
-                expected_size = excluded.expected_size,
+                capture_dt    = COALESCE(excluded.capture_dt, assets.capture_dt),
+                added_dt      = COALESCE(excluded.added_dt, assets.added_dt),
+                expected_size = COALESCE(excluded.expected_size, assets.expected_size),
                 updated_at    = excluded.updated_at
             """,
             (
@@ -138,6 +141,14 @@ class StateStore:
         self._conn.execute(
             "UPDATE assets SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
             (error[:1000], _now(), asset_id),
+        )
+        self._conn.commit()
+
+    def update_dest(self, asset_id: str, dest_rel: str) -> None:
+        """Re-point an asset to a new destination (collision re-resolution)."""
+        self._conn.execute(
+            "UPDATE assets SET dest_path = ?, updated_at = ? WHERE id = ?",
+            (dest_rel, _now(), asset_id),
         )
         self._conn.commit()
 
