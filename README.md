@@ -81,6 +81,9 @@ failing.
 icloud-photo-sync [GLOBAL] login
 icloud-photo-sync [GLOBAL] sync [--update] [--watch SECONDS] [--until-found N]
 icloud-photo-sync [GLOBAL] status
+icloud-photo-sync [GLOBAL] local-clean [--max-size SIZE] [--lm-url URL]
+                                       [--lm-model NAME] [--flag CATS]
+                                       [--limit N] [--reclassify] [--no-browser]
 
 GLOBAL options:
   -u, --username APPLE_ID   Apple ID (else $ICLOUD_SYNC_USERNAME, else prompt)
@@ -99,9 +102,60 @@ GLOBAL options:
   * `--watch N` — repeat the incremental pass every `N` seconds (min 300).
 * **`status`** — completed / pending / failed counts, last pass times, total
   bytes downloaded, and any failed assets (which are retried on the next sync).
+* **`local-clean`** — find and remove junk images (screenshots, memes, saved
+  web graphics) from an already-downloaded tree. No iCloud login required. See
+  the section below.
 
 Exit codes: `2` = account precondition problem, `3` = session expired (run
 `login`), `4` = must accept Apple terms, `1` = other error.
+
+---
+
+## Clean out screenshots & memes (`local-clean`)
+
+Over the years an iCloud library accumulates small non-photos: screenshots,
+shared memes, saved web graphics. `local-clean` finds them locally and lets you
+trash them after a visual review. It never contacts iCloud.
+
+```bash
+# From the photo root (or pass -d PATH). Needs a local vision model running.
+icloud-photo-sync local-clean
+```
+
+How it works:
+
+1. **Scan** — walks the tree for JPG/PNG files at or below `--max-size`
+   (default 1 MB — real camera photos are almost always larger).
+2. **Classify** — sends each image to a **local** vision model and bins it as
+   `screenshot`, `meme`, `photo`, or `other`. Results are cached (keyed by path
+   + size + mtime), so re-runs are instant and Ctrl-C is always safe — it
+   resumes where it stopped. At ~10-15 s per image, use `--limit N` to work
+   through a large library in chunks.
+3. **Review** — opens a local web page with a grid of every flagged image
+   (categories `screenshot,meme,other` by default), all pre-selected for
+   deletion. Deselect anything you want to keep, then click **Move to Trash**.
+4. **Trash** — the selected files go to the macOS Trash via Finder, so they keep
+   *Put Back* and are trivially recoverable. Nothing is ever deleted without
+   your click.
+
+The vision model must speak the OpenAI chat API. [LM Studio](https://lmstudio.ai)
+with a vision model (e.g. `qwen/qwen3.5-9b`) works out of the box: load the
+model, start its local server, and leave the defaults. Point elsewhere with
+`--lm-url` / `--lm-model` (or `$ICLOUD_SYNC_LM_URL`).
+
+```
+--max-size SIZE    Only images at or below this (e.g. 500KB, 2MB). Default 1MB.
+--lm-url URL       Vision model base URL. Default http://127.0.0.1:1234.
+--lm-model NAME    Model name. Default qwen/qwen3.5-9b.
+--flag CATS        Comma-separated categories to flag. Default screenshot,meme,other.
+--limit N          Classify at most N new images this run (resume later).
+--reclassify       Ignore the cache and re-classify everything.
+--no-browser       Print the review URL instead of opening a browser.
+```
+
+**First run trashes via Finder**, so macOS shows a one-time prompt asking to let
+your terminal control Finder — approve it (System Settings → Privacy & Security
+→ Automation). If denied, trashing fails with a reminder and no files move.
 
 ---
 

@@ -69,3 +69,20 @@ class DownloadError(ICloudSyncError):
 
 class OperationCancelled(ICloudSyncError):
     """The user asked to stop (SIGINT/SIGTERM)."""
+
+
+# --- Local classification (local-clean) --------------------------------------
+
+
+class ClassifierUnavailableError(ICloudSyncError):
+    """The local vision model endpoint (LM Studio) could not be reached.
+
+    Carries a human-readable message naming the URL and how to fix it.
+    """
+
+
+class ClassificationError(ICloudSyncError):
+    """One image could not be classified (API error, bad JSON, unreadable file).
+
+    Non-fatal: the run logs it and moves on to the next image.
+    """

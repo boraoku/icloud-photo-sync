@@ -20,6 +20,7 @@ from keyring.errors import KeyringError, PasswordDeleteError
 APP_NAME = "icloud-photo-sync"
 KEYRING_SERVICE = "icloud-photo-sync"
 ENV_USERNAME = "ICLOUD_SYNC_USERNAME"
+ENV_LM_URL = "ICLOUD_SYNC_LM_URL"
 
 # Conservative defaults (all overridable via CLI flags where it makes sense).
 DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024        # 8 MiB streamed reads
@@ -35,6 +36,15 @@ DEFAULT_INDEXING_RETRY = 30.0                 # wait between "still indexing" re
 DEFAULT_INDEXING_MAX_WAIT = 1800.0           # give up waiting for indexing after 30m
 PARTIAL_FLUSH_BYTES = 16 * 1024 * 1024        # throttle bytes_done writes to state
 PARTIAL_FLUSH_SECS = 5.0
+
+# local-clean: local vision-model classification of small screenshots/memes.
+DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234"   # LM Studio, OpenAI-compatible
+DEFAULT_LM_MODEL = "qwen/qwen3.5-9b"            # vision-capable
+DEFAULT_CLEAN_MAX_BYTES = 1 * 1024 * 1024       # only consider images ≤ 1 MiB
+DEFAULT_LM_CONNECT_TIMEOUT = 5.0
+DEFAULT_LM_READ_TIMEOUT = 180.0                 # ~15s typical; headroom for cold load
+DEFAULT_FLAG_CATEGORIES = ("screenshot", "meme", "other")
+DEFAULT_THUMB_MAX_DIM = 1024                    # px; downscale for both LM and review
 
 
 def default_config_root() -> Path:
@@ -112,6 +122,71 @@ class AppConfig:
             if not hasattr(cfg, k):
                 # A silently-dropped typo would run with defaults and be
                 # near-impossible to debug; fail loudly instead.
+                raise TypeError(f"unknown config override: {k!r}")
+            if v is not None:
+                setattr(cfg, k, v)
+        return cfg
+
+    @property
+    def timeout(self) -> tuple[float, float]:
+        return (self.connect_timeout, self.read_timeout)
+
+
+def _clean_cache_key(output_root: Path) -> str:
+    raw = str(output_root.resolve()).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:10]
+
+
+@dataclass
+class LocalCleanConfig:
+    """Configuration for the credential-free ``local-clean`` command.
+
+    Deliberately independent of :class:`AppConfig`: ``local-clean`` needs no
+    Apple ID, and its classification cache is keyed by the photo tree alone
+    (a file's category is a property of the file, not of any account), so two
+    accounts syncing to the same tree share one cache.
+    """
+
+    output_root: Path
+    cache_db: Path
+    logs_dir: Path
+
+    lm_base_url: str = DEFAULT_LM_BASE_URL
+    lm_model: str = DEFAULT_LM_MODEL
+    max_bytes: int = DEFAULT_CLEAN_MAX_BYTES
+    flag_categories: tuple[str, ...] = DEFAULT_FLAG_CATEGORIES
+    thumb_max_dim: int = DEFAULT_THUMB_MAX_DIM
+    port: int = 0
+    limit: int | None = None
+    reclassify: bool = False
+    open_browser: bool = True
+    verbose: bool = False
+
+    connect_timeout: float = DEFAULT_LM_CONNECT_TIMEOUT
+    read_timeout: float = DEFAULT_LM_READ_TIMEOUT
+
+    @classmethod
+    def create(
+        cls,
+        output_root: Path,
+        *,
+        config_root: Path | None = None,
+        **overrides,
+    ) -> "LocalCleanConfig":
+        output_root = Path(output_root).resolve()
+        config_root = (config_root or default_config_root()).resolve()
+        logs_dir = config_root / "logs"
+        state_dir = config_root / "state"
+        cache_db = state_dir / f"local-clean-{_clean_cache_key(output_root)}.db"
+
+        for d in (config_root, logs_dir, state_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        cfg = cls(output_root=output_root, cache_db=cache_db, logs_dir=logs_dir)
+        for k, v in overrides.items():
+            if not hasattr(cfg, k):
+                # Match AppConfig.create: a silently-dropped typo would run with
+                # defaults and be near-impossible to debug; fail loudly instead.
                 raise TypeError(f"unknown config override: {k!r}")
             if v is not None:
                 setattr(cfg, k, v)

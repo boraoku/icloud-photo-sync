@@ -17,8 +17,10 @@ import typer
 from . import config as cfg
 from . import icloud_client as ic
 from .auth import SessionManager
-from .config import MIN_WATCH_INTERVAL, AppConfig
+from .classifier import CATEGORIES
+from .config import MIN_WATCH_INTERVAL, AppConfig, LocalCleanConfig
 from .downloader import Downloader
+from .local_clean import run_local_clean, _parse_size
 from .errors import (
     AccountPreconditionError,
     AcceptTermsError,
@@ -261,6 +263,62 @@ def status(ctx: typer.Context) -> None:
                 typer.echo(f"  {row['filename']}: {row['error']}")
     finally:
         state.close()
+
+
+@app.command("local-clean")
+def local_clean(
+    ctx: typer.Context,
+    max_size: str = typer.Option(
+        "1MB", "--max-size", help="Only images at or below this size (e.g. 500KB, 2MB)."
+    ),
+    lm_url: str = typer.Option(
+        cfg.DEFAULT_LM_BASE_URL, "--lm-url", envvar=cfg.ENV_LM_URL,
+        help="Local vision-model base URL (LM Studio, OpenAI-compatible).",
+    ),
+    lm_model: str = typer.Option(
+        cfg.DEFAULT_LM_MODEL, "--lm-model", help="Vision model name."
+    ),
+    flag: str = typer.Option(
+        ",".join(cfg.DEFAULT_FLAG_CATEGORIES), "--flag",
+        help="Comma-separated categories to flag for deletion "
+             f"(any of: {', '.join(CATEGORIES)}).",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Classify at most N new images this run (resume later)."
+    ),
+    port: int = typer.Option(0, "--port", help="Review server port (0 = auto)."),
+    reclassify: bool = typer.Option(
+        False, "--reclassify", help="Ignore the classification cache and redo everything."
+    ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the review URL instead of opening a browser."
+    ),
+) -> None:
+    """Find small screenshots/memes locally, review them, move to Trash. No iCloud login."""
+    octx: AppContext = ctx.obj
+    output_root = (octx.directory or Path.cwd()).resolve()
+
+    flag_categories = tuple(c.strip() for c in flag.split(",") if c.strip())
+    bad = [c for c in flag_categories if c not in CATEGORIES]
+    if bad:
+        raise typer.BadParameter(
+            f"unknown --flag categories {bad}; choose from {', '.join(CATEGORIES)}"
+        )
+
+    config = LocalCleanConfig.create(
+        output_root,
+        max_bytes=_parse_size(max_size),
+        lm_base_url=lm_url,
+        lm_model=lm_model,
+        flag_categories=flag_categories,
+        limit=limit,
+        port=port,
+        reclassify=reclassify,
+        open_browser=not no_browser,
+        verbose=octx.verbose,
+    )
+    setup_logging(config.logs_dir, config.verbose)
+    raise typer.Exit(run_local_clean(config))
 
 
 def _print_stats(stats) -> None:
