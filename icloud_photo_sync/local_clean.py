@@ -1,8 +1,11 @@
 """``local-clean``: find small screenshots/memes/junk images and trash them.
 
-Walks the photo tree for small JPG/PNG files, classifies each with a local
-vision model (cached and resumable), then opens a browser review grid where the
-user confirms which to move to the Trash. Requires no iCloud login.
+Walks the photo tree for small JPG/PNG files and classifies each with a local
+vision model (cached and resumable). A browser review grid opens right away and
+newly flagged images stream into it as classification proceeds, so review can
+start within seconds rather than after the whole library is processed. The user
+trashes any number of rounds and clicks Finish (or Ctrl-C) to end. No iCloud
+login required.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +22,7 @@ from pathlib import Path
 import typer
 from tqdm import tqdm
 
-from .classifier import LMStudioClassifier, prepare_image
+from .classifier import Classification, LMStudioClassifier, prepare_image
 from .clean_cache import CleanCache
 from .config import LocalCleanConfig
 from .errors import ClassificationError, ClassifierUnavailableError
@@ -30,6 +34,8 @@ logger = get_logger(__name__)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 SECONDS_PER_IMAGE = 15  # rough LM Studio latency, for the ETA hint
+CONSECUTIVE_ERROR_LIMIT = 5  # abort a run if the model dies mid-stream
+ZERO_FLAGGED_GRACE = 3.0  # let the open tab's final poll render "Nothing flagged"
 
 
 @dataclass(frozen=True)
@@ -60,13 +66,16 @@ def scan_images(root: Path, max_bytes: int) -> list[ImageFile]:
     """Return small JPG/PNG files under ``root``, sorted by relative path.
 
     Excludes symlinks, ``.part`` in-progress downloads, zero-byte files, and
-    anything over ``max_bytes``; prunes hidden directories.
+    anything over ``max_bytes``; prunes hidden directories and skips dot-files
+    (e.g. AppleDouble sidecars like ``._IMG_0042.JPG``).
     """
     root = Path(root).resolve()
     found: list[ImageFile] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for name in filenames:
+            if name.startswith("."):  # AppleDouble sidecars, .DS_Store, etc.
+                continue
             if Path(name).suffix.lower() not in IMAGE_SUFFIXES:
                 continue
             p = Path(dirpath) / name
@@ -97,7 +106,7 @@ def _fmt_eta(n: int) -> str:
 
 
 def run_local_clean(config: LocalCleanConfig) -> int:
-    """Execute the scan → classify → review → trash flow. Returns an exit code."""
+    """Execute the scan → stream-classify → review → trash flow. Returns exit code."""
     root = config.output_root
     typer.secho(f"Scanning {root} for images ≤ "
                 f"{config.max_bytes // 1024} KiB…", fg=typer.colors.BLUE)
@@ -109,76 +118,76 @@ def run_local_clean(config: LocalCleanConfig) -> int:
     cache = CleanCache(config.cache_db)
     with tempfile.TemporaryDirectory(prefix="local-clean-") as tmp:
         work_dir = Path(tmp)
-        try:
-            classified = _classify_all(images, cache, config, work_dir)
-        except KeyboardInterrupt:
-            # Every verdict was committed the moment it landed (CleanCache.put),
-            # so there is nothing to save here — just report and let the user
-            # re-run to resume from the cache.
-            cache.close()
-            typer.secho(
-                "\nStopped. Cached results are preserved; re-run local-clean "
-                "to resume.",
-                fg=typer.colors.YELLOW,
-            )
-            return 130
+        cached, process = _split_cached(images, cache, config)
+        n_misses = sum(1 for img in process if img.rel not in cached)
 
-        _print_category_summary(images, classified, config)
+        # Fail fast (exit 1, no browser) if the model is down but work remains —
+        # done BEFORE the server starts, matching the previous behavior.
+        classifier = _make_classifier(config, work_dir, cache) if n_misses else None
 
-        flagged: list[FlaggedItem] = []
-        for img in images:
-            c = classified.get(img.rel)
-            if c is None or c.category not in config.flag_categories:
-                continue
-            if not img.path.exists():  # trashed/moved since the scan
-                continue
-            flagged.append(
-                FlaggedItem(
-                    index=len(flagged),
-                    path=img.path,
-                    rel=img.rel,
-                    category=c.category,
-                    confidence=c.confidence,
-                    reason=c.reason,
-                    size=img.size,
-                )
-            )
-
-        if not flagged:
-            cache.close()
-            typer.secho(
-                "Nothing flagged — all small images look like real photos.",
-                fg=typer.colors.GREEN,
-            )
-            return 0
-
-        _generate_thumbnails(flagged, work_dir, config)
-        return _review_and_trash(flagged, cache, work_dir, config)
-
-
-def _classify_all(images, cache, config, work_dir) -> dict[str, object]:
-    """Return {rel: Classification|None}. Cache hits are free; misses hit the LM."""
-    results: dict[str, object] = {}
-    todo = []
-    for img in images:
-        cached = None if config.reclassify else cache.get(img, config.lm_model)
-        if cached is not None:
-            results[img.rel] = cached
+        server = ReviewServer(
+            thumbs_dir=work_dir, trash_fn=move_to_trash,
+            token=secrets.token_urlsafe(16), port=config.port,
+        )
+        server.start()
+        url = server.url
+        typer.secho(f"\nReview page: {url}", fg=typer.colors.BLUE)
+        if config.open_browser:
+            webbrowser.open(url)
         else:
-            todo.append(img)
+            typer.echo("Open that URL in your browser; results stream in as they classify.")
+        if n_misses:
+            typer.echo(
+                f"Classifying {n_misses} new image(s) via {config.lm_model} "
+                f"(est. {_fmt_eta(n_misses)}). Ctrl-C is safe — progress is cached."
+            )
 
-    if config.limit is not None and len(todo) > config.limit:
-        skipped = len(todo) - config.limit
-        todo = todo[: config.limit]
+        interrupted = False
+        results: dict[str, Classification | None] | None = None
+        try:
+            results = _classify_and_publish(
+                process, cached, classifier, cache, server, config, work_dir
+            )
+        except KeyboardInterrupt:
+            interrupted = True
+        server.mark_done()
+        if results is not None:
+            _print_category_summary(results, config)
+        return _finish_session(server, cache, interrupted)
+
+
+def _split_cached(
+    images: list[ImageFile], cache: CleanCache, config: LocalCleanConfig
+) -> tuple[dict[str, Classification], list[ImageFile]]:
+    """Split into (cached verdicts, ordered process list).
+
+    ``process`` is in scan order and holds every cache hit plus up to ``--limit``
+    misses; the excess misses are deferred to a later run.
+    """
+    cached: dict[str, Classification] = {}
+    misses: list[ImageFile] = []
+    for img in images:
+        c = None if config.reclassify else cache.get(img, config.lm_model)
+        if c is not None:
+            cached[img.rel] = c
+        else:
+            misses.append(img)
+
+    excluded: set[str] = set()
+    if config.limit is not None and len(misses) > config.limit:
+        excluded = {m.rel for m in misses[config.limit:]}
         typer.secho(
-            f"--limit {config.limit}: classifying {len(todo)} now, "
-            f"{skipped} left for a later run.",
+            f"--limit {config.limit}: classifying {config.limit} new image(s) now, "
+            f"{len(excluded)} left for a later run.",
             fg=typer.colors.YELLOW,
         )
+    process = [img for img in images if img.rel not in excluded]
+    return cached, process
 
-    if not todo:
-        return results
 
+def _make_classifier(
+    config: LocalCleanConfig, work_dir: Path, cache: CleanCache
+) -> LMStudioClassifier:
     classifier = LMStudioClassifier(
         base_url=config.lm_base_url,
         model=config.lm_model,
@@ -192,76 +201,112 @@ def _classify_all(images, cache, config, work_dir) -> dict[str, object]:
         cache.close()
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from exc
+    return classifier
 
-    typer.echo(
-        f"Classifying {len(todo)} image(s) via {config.lm_model} "
-        f"(est. {_fmt_eta(len(todo))}). Ctrl-C is safe — progress is cached."
-    )
+
+def _classify_and_publish(
+    process, cached, classifier, cache, server, config, work_dir
+) -> dict[str, Classification | None]:
+    """The unified loop: verdict from cache or LM, publish flagged items live.
+
+    Sole producer of flagged indices (monotonic). Returns {rel: Classification|None}.
+    """
+    results: dict[str, Classification | None] = {}
+    total = len(process)
+    next_index = 0
     errors = 0
-    for img in tqdm(todo, desc="Classifying", unit="img"):
-        try:
-            c = classifier.classify(img.path)
-            cache.put(img, config.lm_model, c)
-            results[img.rel] = c
-        except ClassificationError as exc:
-            errors += 1
-            results[img.rel] = None
-            logger.warning("skipping %s: %s", img.rel, exc)
+    consecutive = 0
+    for i, img in enumerate(tqdm(process, desc="Classifying", unit="img")):
+        if server.finish_requested:
+            break
+        c = cached.get(img.rel)
+        if c is None:
+            try:
+                c = classifier.classify(img.path)
+                cache.put(img, config.lm_model, c)
+                consecutive = 0
+            except ClassificationError as exc:
+                errors += 1
+                consecutive += 1
+                results[img.rel] = None
+                logger.warning("skipping %s: %s", img.rel, exc)
+                server.set_progress(i + 1, total)
+                if consecutive >= CONSECUTIVE_ERROR_LIMIT:
+                    tqdm.write(
+                        f"Aborting after {consecutive} consecutive classification "
+                        "errors — is the model still loaded? Progress is cached."
+                    )
+                    break
+                continue
+        results[img.rel] = c
+        server.set_progress(i + 1, total)
+        if c.category in config.flag_categories and img.path.exists():
+            if _publish_flagged(img, c, next_index, server, work_dir, config):
+                next_index += 1
     if errors:
-        typer.secho(f"{errors} image(s) could not be classified (skipped).",
-                    fg=typer.colors.YELLOW)
+        tqdm.write(f"{errors} image(s) could not be classified (skipped).")
     return results
 
 
-def _print_category_summary(images, classified, config) -> None:
+def _publish_flagged(img, c, index, server, work_dir, config) -> bool:
+    """Write the thumbnail (BEFORE publishing) and publish. False on thumb failure."""
+    try:
+        data, _ = prepare_image(img.path, config.thumb_max_dim, work_dir)
+        (work_dir / f"{index}.jpg").write_bytes(data)
+    except OSError as exc:
+        logger.debug("thumbnail failed for %s: %s", img.rel, exc)
+        return False
+    server.publish(
+        FlaggedItem(
+            index=index, path=img.path, rel=img.rel,
+            category=c.category, confidence=c.confidence,
+            reason=c.reason, size=img.size,
+        )
+    )
+    return True
+
+
+def _print_category_summary(results, config) -> None:
     counts: dict[str, int] = {}
-    for img in images:
-        c = classified.get(img.rel)
+    for c in results.values():
         if c is not None:
             counts[c.category] = counts.get(c.category, 0) + 1
     parts = [f"{cat}={counts[cat]}" for cat in sorted(counts)]
     if parts:
         typer.echo("Categories: " + ", ".join(parts))
-    flagged_cats = ", ".join(config.flag_categories)
-    typer.echo(f"Flagging for deletion: {flagged_cats}")
+    typer.echo(f"Flagged for deletion: {', '.join(config.flag_categories)}")
 
 
-def _generate_thumbnails(flagged, work_dir, config) -> None:
-    for it in tqdm(flagged, desc="Thumbnails", unit="img"):
+def _finish_session(server: ReviewServer, cache: CleanCache, interrupted: bool) -> int:
+    """Wait for the user to finish (or Ctrl-C), then report and clean up."""
+    # Zero flagged and classification completed: nothing to review.
+    if not interrupted and server.item_count == 0:
         try:
-            data, _ = prepare_image(it.path, config.thumb_max_dim, work_dir)
-            (work_dir / f"{it.index}.jpg").write_bytes(data)
-        except OSError as exc:
-            logger.debug("thumbnail failed for %s: %s", it.rel, exc)
-
-
-def _review_and_trash(flagged, cache, work_dir, config) -> int:
-    token = secrets.token_urlsafe(16)
-    server = ReviewServer(
-        items=flagged,
-        thumbs_dir=work_dir,
-        trash_fn=move_to_trash,
-        token=token,
-        port=config.port,
-    )
-    url = server.url
-    typer.secho(f"\nReview {len(flagged)} flagged image(s): {url}",
-                fg=typer.colors.BLUE)
-    if config.open_browser:
-        webbrowser.open(url)
-    else:
-        typer.echo("Open that URL in your browser to review.")
-    typer.echo("Waiting for your selection… (Ctrl-C to cancel without deleting)")
-
-    outcome = server.serve()
-    if outcome is None:
+            time.sleep(ZERO_FLAGGED_GRACE)  # let the tab render "Nothing flagged"
+        except KeyboardInterrupt:
+            pass
+        server.close()
         cache.close()
-        typer.secho("Cancelled — nothing was moved. Classifications are cached.",
-                    fg=typer.colors.YELLOW)
+        typer.secho("Nothing flagged — all small images look like real photos.",
+                    fg=typer.colors.GREEN)
         return 0
 
+    if not interrupted:
+        typer.echo(
+            "Classification finished. Review in the browser and click Finish "
+            "there — or press Ctrl-C here to end. Files already moved to Trash "
+            "stay in the Trash."
+        )
+        try:
+            server.wait_finished()
+        except KeyboardInterrupt:
+            interrupted = True
+
+    server.close()
+    outcome = server.outcome
     cache.remove(outcome.moved)
     cache.close()
+
     typer.secho(f"Moved {len(outcome.moved)} file(s) to the Trash.",
                 fg=typer.colors.GREEN)
     if outcome.failed:
@@ -269,5 +314,9 @@ def _review_and_trash(flagged, cache, work_dir, config) -> int:
                     fg=typer.colors.RED, err=True)
         for rel, err in outcome.failed:
             typer.secho(f"  {rel}: {err}", fg=typer.colors.RED, err=True)
+    if interrupted and not outcome.moved and not outcome.failed:
+        typer.secho("Progress is cached; re-run local-clean to resume.",
+                    fg=typer.colors.YELLOW)
+    if outcome.failed:
         return 1
-    return 0
+    return 130 if interrupted else 0

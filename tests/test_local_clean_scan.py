@@ -32,6 +32,14 @@ def test_scan_prunes_hidden_dirs(tmp_path):
     assert [f.rel for f in found] == ["2023/visible.jpg"]
 
 
+def test_scan_skips_dot_files(tmp_path):
+    _write(tmp_path / "2023/IMG_0042.JPG", 100)       # included
+    _write(tmp_path / "2023/._IMG_0042.JPG", 100)     # excluded: AppleDouble sidecar
+    _write(tmp_path / "2023/.hidden.png", 100)        # excluded: dot-file
+    found = scan_images(tmp_path, max_bytes=1_000_000)
+    assert [f.rel for f in found] == ["2023/IMG_0042.JPG"]
+
+
 def test_scan_records_size_and_mtime(tmp_path):
     p = tmp_path / "2023/x.jpg"
     _write(p, 321)
