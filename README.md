@@ -276,6 +276,27 @@ resume-vs-restart logic against a local mock HTTP server (no iCloud account
 needed). The live login + download path requires a real account and is exercised
 manually per the steps above.
 
+## Acknowledgments
+
+This tool stands on the shoulders of several open-source projects:
+
+| Project | Role | License |
+|---|---|---|
+| [pyicloud](https://github.com/picklepete/pyicloud) | iCloud web/CloudKit client (auth, 2FA, photo enumeration) | MIT |
+| [keyring](https://github.com/jaraco/keyring) | Storing the iCloud password in the macOS Keychain | MIT |
+| [requests](https://github.com/psf/requests) | HTTP transfers, including `Range`-based resume | Apache-2.0 |
+| [typer](https://github.com/fastapi/typer) | Command-line interface | MIT |
+| [tqdm](https://github.com/tqdm/tqdm) | Progress bars | MPL-2.0 / MIT |
+| [pytest](https://github.com/pytest-dev/pytest) | Test suite (dev only) | MIT |
+
+The `local-clean` feature classifies images through any OpenAI-compatible local
+vision model, and is tested against [LM Studio](https://lmstudio.ai). The
+[`icloudpd`](https://github.com/icloud-photos-downloader/icloud_photos_downloader)
+project (MIT) is documented above as a drop-in fallback engine.
+
+Each dependency is used under its own license; this project bundles none of
+their source.
+
 ## License
 
-MIT.
+Released under the [MIT License](LICENSE). © 2026 Bora Okumusoglu.
