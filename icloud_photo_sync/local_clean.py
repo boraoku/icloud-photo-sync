@@ -16,6 +16,7 @@ import secrets
 import tempfile
 import time
 import webbrowser
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,21 +63,23 @@ def _parse_size(text: str) -> int:
     return int(value * factor)
 
 
-def scan_images(root: Path, max_bytes: int) -> list[ImageFile]:
-    """Return small JPG/PNG files under ``root``, sorted by relative path.
+def iter_media_files(
+    root: Path, suffixes: set[str]
+) -> Iterator[tuple[Path, str, os.stat_result]]:
+    """Yield ``(path, rel, stat)`` for regular files under ``root`` matching ``suffixes``.
 
-    Excludes symlinks, ``.part`` in-progress downloads, zero-byte files, and
-    anything over ``max_bytes``; prunes hidden directories and skips dot-files
-    (e.g. AppleDouble sidecars like ``._IMG_0042.JPG``).
+    Prunes hidden directories, skips dot-files (e.g. AppleDouble sidecars like
+    ``._IMG_0042.JPG``), symlinks, and zero-byte files. ``.part`` in-progress
+    downloads are excluded by the suffix filter. ``suffixes`` are matched
+    case-insensitively; ``rel`` is the posix path relative to ``root``.
     """
     root = Path(root).resolve()
-    found: list[ImageFile] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for name in filenames:
             if name.startswith("."):  # AppleDouble sidecars, .DS_Store, etc.
                 continue
-            if Path(name).suffix.lower() not in IMAGE_SUFFIXES:
+            if Path(name).suffix.lower() not in suffixes:
                 continue
             p = Path(dirpath) / name
             try:
@@ -85,12 +88,25 @@ def scan_images(root: Path, max_bytes: int) -> list[ImageFile]:
                 st = p.stat()
             except OSError:
                 continue
-            if not (0 < st.st_size <= max_bytes):
+            if st.st_size == 0:
                 continue
-            rel = p.relative_to(root).as_posix()
-            found.append(
-                ImageFile(path=p, rel=rel, size=st.st_size, mtime_ns=st.st_mtime_ns)
-            )
+            yield p, p.relative_to(root).as_posix(), st
+
+
+def scan_images(root: Path, max_bytes: int) -> list[ImageFile]:
+    """Return small JPG/PNG files under ``root``, sorted by relative path.
+
+    Excludes symlinks, ``.part`` in-progress downloads, zero-byte files, and
+    anything over ``max_bytes``; prunes hidden directories and skips dot-files
+    (e.g. AppleDouble sidecars like ``._IMG_0042.JPG``).
+    """
+    found: list[ImageFile] = []
+    for p, rel, st in iter_media_files(root, IMAGE_SUFFIXES):
+        if st.st_size > max_bytes:
+            continue
+        found.append(
+            ImageFile(path=p, rel=rel, size=st.st_size, mtime_ns=st.st_mtime_ns)
+        )
     found.sort(key=lambda f: f.rel)
     return found
 

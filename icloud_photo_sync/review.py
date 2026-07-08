@@ -152,41 +152,41 @@ class _Handler(BaseHTTPRequestHandler):
         })
 
 
-class ReviewServer:
-    """Streams flagged images to a browser and applies trash decisions.
+class TrashSession:
+    """Shared HTTP review machinery: server lifecycle + trash decisions.
+
+    Owns the token-guarded, three-phase :meth:`do_trash` and the finish
+    signalling common to every browser-review flow. Subclasses pass their own
+    request handler class (which wires the routes they need) and populate
+    ``_by_index`` with items exposing ``index``/``path``/``rel``; the streaming
+    image review and the video review both build on this.
 
     Runs its HTTP server on a daemon thread (:meth:`start`). The main thread
-    publishes items and progress; the server thread only mutates lock-protected
-    state and never prints, so terminal output (tqdm/typer) stays clean.
+    drives the flow; the server thread only mutates lock-protected state and
+    never prints, so terminal output (tqdm/typer) stays clean.
     """
 
     def __init__(
         self,
-        thumbs_dir: Path,
+        handler_cls: type[BaseHTTPRequestHandler],
         trash_fn: Callable[[list[Path]], list[TrashResult]],
         token: str,
         host: str = "127.0.0.1",
         port: int = 0,
     ) -> None:
-        self.thumbs_dir = Path(thumbs_dir)
         self.trash_fn = trash_fn
         self.token = token
-        self.page = render_page(token)
 
         self._lock = threading.Lock()
-        self._items: list[FlaggedItem] = []
-        self._by_index: dict[int, FlaggedItem] = {}
+        self._by_index: dict[int, object] = {}
         self._trashed: set[int] = set()
-        self._classified = 0
-        self._total = 0
-        self._done = False
         self._finish = threading.Event()
         self.outcome = TrashOutcome()          # accumulated across all trash rounds
 
         self._thread: threading.Thread | None = None
         self._closed = False
 
-        self._httpd = ThreadingHTTPServer((host, port), _Handler)
+        self._httpd = ThreadingHTTPServer((host, port), handler_cls)
         self._httpd.review = self  # type: ignore[attr-defined]
 
     @property
@@ -212,27 +212,7 @@ class ReviewServer:
             self._thread.join(timeout=5)
         self._httpd.server_close()
 
-    # --- main-thread producers -----------------------------------------------
-
-    def publish(self, item: FlaggedItem) -> None:
-        with self._lock:
-            assert item.index == len(self._items), "indices must be monotonic"
-            self._items.append(item)
-            self._by_index[item.index] = item
-
-    def set_progress(self, classified: int, total: int) -> None:
-        with self._lock:
-            self._classified = classified
-            self._total = total
-
-    def mark_done(self) -> None:
-        with self._lock:
-            self._done = True
-
-    @property
-    def item_count(self) -> int:
-        with self._lock:
-            return len(self._items)
+    # --- finish signalling ---------------------------------------------------
 
     @property
     def finish_requested(self) -> bool:
@@ -242,25 +222,8 @@ class ReviewServer:
         """Block until the page (or a caller) requests finish. Ctrl-C propagates."""
         self._finish.wait()
 
-    # --- handler-facing ------------------------------------------------------
-
     def request_finish(self) -> None:
         self._finish.set()
-
-    def snapshot(self, since: int) -> dict:
-        with self._lock:
-            fresh = [
-                _item_payload(it)
-                for it in self._items[since:]
-                if it.index not in self._trashed
-            ]
-            return {
-                "items": fresh,
-                "next": len(self._items),   # explicit cursor; trashed filtering
-                "classified": self._classified,   # breaks "cursor == count received"
-                "total": self._total,
-                "done": self._done,
-            }
 
     def finish_payload(self) -> dict:
         with self._lock:
@@ -269,11 +232,7 @@ class ReviewServer:
                 "failed": [{"rel": r, "error": e} for r, e in self.outcome.failed],
             }
 
-    def thumb_bytes(self, index: int) -> bytes | None:
-        p = self.thumbs_dir / f"{index}.jpg"
-        if not p.exists():
-            return None
-        return p.read_bytes()
+    # --- trash application ---------------------------------------------------
 
     def do_trash(self, ids: Sequence[int]) -> TrashOutcome:
         # (a) Under lock: resolve ids, skip unknown/already-trashed, mark trashed
@@ -308,6 +267,77 @@ class ReviewServer:
             self.outcome.moved += round_outcome.moved
             self.outcome.failed += round_outcome.failed
         return round_outcome
+
+
+class ReviewServer(TrashSession):
+    """Streams flagged images to a browser and applies trash decisions.
+
+    Adds live streaming (:meth:`publish`, :meth:`snapshot`, progress) on top of
+    :class:`TrashSession`; the main thread publishes items and progress as
+    classification proceeds.
+    """
+
+    def __init__(
+        self,
+        thumbs_dir: Path,
+        trash_fn: Callable[[list[Path]], list[TrashResult]],
+        token: str,
+        host: str = "127.0.0.1",
+        port: int = 0,
+    ) -> None:
+        super().__init__(_Handler, trash_fn, token, host, port)
+        self.thumbs_dir = Path(thumbs_dir)
+        self.page = render_page(token)
+
+        self._items: list[FlaggedItem] = []
+        self._classified = 0
+        self._total = 0
+        self._done = False
+
+    # --- main-thread producers -----------------------------------------------
+
+    def publish(self, item: FlaggedItem) -> None:
+        with self._lock:
+            assert item.index == len(self._items), "indices must be monotonic"
+            self._items.append(item)
+            self._by_index[item.index] = item
+
+    def set_progress(self, classified: int, total: int) -> None:
+        with self._lock:
+            self._classified = classified
+            self._total = total
+
+    def mark_done(self) -> None:
+        with self._lock:
+            self._done = True
+
+    @property
+    def item_count(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    # --- handler-facing ------------------------------------------------------
+
+    def snapshot(self, since: int) -> dict:
+        with self._lock:
+            fresh = [
+                _item_payload(it)
+                for it in self._items[since:]
+                if it.index not in self._trashed
+            ]
+            return {
+                "items": fresh,
+                "next": len(self._items),   # explicit cursor; trashed filtering
+                "classified": self._classified,   # breaks "cursor == count received"
+                "total": self._total,
+                "done": self._done,
+            }
+
+    def thumb_bytes(self, index: int) -> bytes | None:
+        p = self.thumbs_dir / f"{index}.jpg"
+        if not p.exists():
+            return None
+        return p.read_bytes()
 
 
 _TEMPLATE = """<!doctype html>

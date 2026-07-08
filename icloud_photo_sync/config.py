@@ -197,6 +197,50 @@ class LocalCleanConfig:
         return (self.connect_timeout, self.read_timeout)
 
 
+@dataclass
+class VideoCleanConfig:
+    """Configuration for the credential-free ``video-clean`` command.
+
+    Like :class:`LocalCleanConfig` this needs no Apple ID, but it also needs no
+    classification cache or vision model: the scan is a plain size-sorted walk
+    and every decision is the user's, so the only knobs are an optional
+    minimum-size floor and the review server's browser/port behaviour.
+    """
+
+    output_root: Path
+    logs_dir: Path
+
+    min_bytes: int = 0
+    port: int = 0
+    open_browser: bool = True
+    verbose: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        output_root: Path,
+        *,
+        config_root: Path | None = None,
+        **overrides,
+    ) -> "VideoCleanConfig":
+        output_root = Path(output_root).resolve()
+        config_root = (config_root or default_config_root()).resolve()
+        logs_dir = config_root / "logs"
+
+        for d in (config_root, logs_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        cfg = cls(output_root=output_root, logs_dir=logs_dir)
+        for k, v in overrides.items():
+            if not hasattr(cfg, k):
+                # Match AppConfig.create: a silently-dropped typo would run with
+                # defaults and be near-impossible to debug; fail loudly instead.
+                raise TypeError(f"unknown config override: {k!r}")
+            if v is not None:
+                setattr(cfg, k, v)
+        return cfg
+
+
 # --- Credentials (macOS Keychain via `keyring`) ------------------------------
 
 

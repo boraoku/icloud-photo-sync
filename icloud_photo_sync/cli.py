@@ -18,9 +18,10 @@ from . import config as cfg
 from . import icloud_client as ic
 from .auth import SessionManager
 from .classifier import CATEGORIES
-from .config import MIN_WATCH_INTERVAL, AppConfig, LocalCleanConfig
+from .config import MIN_WATCH_INTERVAL, AppConfig, LocalCleanConfig, VideoCleanConfig
 from .downloader import Downloader
 from .local_clean import run_local_clean, _parse_size
+from .video_clean import run_video_clean
 from .errors import (
     AccountPreconditionError,
     AcceptTermsError,
@@ -319,6 +320,32 @@ def local_clean(
     )
     setup_logging(config.logs_dir, config.verbose)
     raise typer.Exit(run_local_clean(config))
+
+
+@app.command("video-clean")
+def video_clean(
+    ctx: typer.Context,
+    min_size: str = typer.Option(
+        "0", "--min-size", help="Only list videos at or above this size (e.g. 50MB, 1GB)."
+    ),
+    port: int = typer.Option(0, "--port", help="Review server port (0 = auto)."),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the review URL instead of opening a browser."
+    ),
+) -> None:
+    """List downloaded videos largest-first, preview them, move selections to Trash. No iCloud login."""
+    octx: AppContext = ctx.obj
+    output_root = (octx.directory or Path.cwd()).resolve()
+
+    config = VideoCleanConfig.create(
+        output_root,
+        min_bytes=_parse_size(min_size),
+        port=port,
+        open_browser=not no_browser,
+        verbose=octx.verbose,
+    )
+    setup_logging(config.logs_dir, config.verbose)
+    raise typer.Exit(run_video_clean(config))
 
 
 def _print_stats(stats) -> None:

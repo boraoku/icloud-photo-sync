@@ -46,6 +46,30 @@ source .venv/bin/activate
 
 Requires Python ≥ 3.11 on macOS (Apple Silicon or Intel).
 
+### Running multiple copies on one machine
+
+You can keep several independent copies of this repo (e.g. one per drive) and run
+each on its own. The one rule: **a virtualenv is not relocatable.** Its
+`.venv/bin/activate` and `pyvenv.cfg` hardcode the absolute path where it was
+created, so if you `cp -R` a folder that already contains `.venv`, the copy's
+`activate` still points PATH back at the *original* copy — the classic symptom is
+`which icloud-photo-sync` showing a different drive than the one you're in.
+
+So for each copy, give it its own environment:
+
+```bash
+cp -R /Volumes/A/icloud-photo-sync /Volumes/B/icloud-photo-sync   # copy anywhere
+cd /Volumes/B/icloud-photo-sync
+./bootstrap.sh          # rebuilds .venv for THIS path if it was copied in
+source .venv/bin/activate
+```
+
+`bootstrap.sh` detects a `.venv` that belongs to a different path and rebuilds it
+automatically, so re-running it after a copy is always safe. Always `source` the
+`activate` from the copy you're standing in (or just call `./.venv/bin/icloud-photo-sync`
+directly, which never depends on PATH). `.venv` is git-ignored, so `git clone`
+never carries a foreign one — only a manual folder copy does.
+
 ## Quick start
 
 ```bash
@@ -84,6 +108,7 @@ icloud-photo-sync [GLOBAL] status
 icloud-photo-sync [GLOBAL] local-clean [--max-size SIZE] [--lm-url URL]
                                        [--lm-model NAME] [--flag CATS]
                                        [--limit N] [--reclassify] [--no-browser]
+icloud-photo-sync [GLOBAL] video-clean [--min-size SIZE] [--port N] [--no-browser]
 
 GLOBAL options:
   -u, --username APPLE_ID   Apple ID (else $ICLOUD_SYNC_USERNAME, else prompt)
@@ -105,6 +130,9 @@ GLOBAL options:
 * **`local-clean`** — find and remove junk images (screenshots, memes, saved
   web graphics) from an already-downloaded tree. No iCloud login required. See
   the section below.
+* **`video-clean`** — list downloaded videos largest-first, preview any of them
+  in the browser, and move the ones you choose to the Trash to reclaim space. No
+  iCloud login and no model required. See the section below.
 
 Exit codes: `2` = account precondition problem, `3` = session expired (run
 `login`), `4` = must accept Apple terms, `1` = other error.
@@ -156,6 +184,42 @@ model, start its local server, and leave the defaults. Point elsewhere with
 **First run trashes via Finder**, so macOS shows a one-time prompt asking to let
 your terminal control Finder — approve it (System Settings → Privacy & Security
 → Automation). If denied, trashing fails with a reminder and no files move.
+
+---
+
+## Reclaim space from videos (`video-clean`)
+
+Videos are the heaviest thing in a photo library — a handful of clips can be more
+than all your stills combined. `video-clean` lists every downloaded video from
+**largest to smallest**, lets you preview any of them, and moves the ones you
+pick to the Trash. It needs **no iCloud login and no model** — the scan is an
+instant `stat` walk, and every deletion is your explicit choice.
+
+```bash
+# From the photo root (or pass -d PATH).
+icloud-photo-sync video-clean
+```
+
+How it works:
+
+1. **Scan** — walks the tree for video files (`.mov`, `.mp4`, `.m4v`, `.mkv`,
+   `.avi`, and more), sorted largest-first. Use `--min-size` to hide small clips.
+2. **Review** — opens a local web page listing each video with its size and date.
+   **Nothing is pre-selected** — it's entirely up to you. Click any card to open
+   a preview player (with seek/scrubbing); tick the checkbox on the ones you want
+   gone. The header shows how much space the current selection would free.
+3. **Trash** — click **Move to Trash** and the selected files go to the macOS
+   Trash via Finder, keeping *Put Back*. The terminal reports how many files
+   moved and how many bytes were freed. Click **Finish** (or press Ctrl-C) to end.
+
+```
+--min-size SIZE    Only list videos at or above this (e.g. 50MB, 1GB). Default 0.
+--port N           Review server port (0 = auto).
+--no-browser       Print the review URL instead of opening a browser.
+```
+
+Like `local-clean`, the first trash triggers the one-time macOS prompt to let
+your terminal control Finder — approve it under Privacy & Security → Automation.
 
 ---
 
