@@ -52,7 +52,7 @@ class RunStats:
     def summary(self) -> str:
         bits = [
             f"{self.downloaded} downloaded",
-            f"{self.skipped} skipped",
+            f"{self.skipped} previously downloaded",
             f"{self.failed} failed",
         ]
         if self.stopped_early:

@@ -260,7 +260,7 @@ def _classify_and_publish(
             if _publish_flagged(img, c, next_index, server, work_dir, config):
                 next_index += 1
     if errors:
-        tqdm.write(f"{errors} image(s) could not be classified (skipped).")
+        tqdm.write(f"{errors} image(s) could not be classified (previously downloaded).")
     return results
 
 
