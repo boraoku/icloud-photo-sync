@@ -204,10 +204,16 @@ How it works:
 
 1. **Scan** — walks the tree for video files (`.mov`, `.mp4`, `.m4v`, `.mkv`,
    `.avi`, and more), sorted largest-first. Use `--min-size` to hide small clips.
-2. **Review** — opens a local web page listing each video with its size and date.
-   **Nothing is pre-selected** — it's entirely up to you. Click any card to open
-   a preview player (with seek/scrubbing); tick the checkbox on the ones you want
-   gone. The header shows how much space the current selection would free.
+2. **Review** — opens a local web page listing each video with its size, date and
+   length (`HH:MM:SS`). Each card shows a poster frame, rendered in the
+   background as you scroll (via `ffmpeg` if you have it, otherwise QuickLook —
+   both optional; cards without one still list and play). Posters are cached in
+   `.icloud-photo-sync/posters/` inside the photo folder, a few tens of KB each,
+   so later runs are instant — deleting that folder just re-renders them, and
+   the scan ignores it. **Nothing is pre-selected** — it's entirely up to you.
+   Click any card to open a preview player (with seek/scrubbing); tick the
+   checkbox on the ones you want gone. The header shows how much space the
+   current selection would free.
 3. **Trash** — click **Move to Trash** and the selected files go to the macOS
    Trash via Finder, keeping *Put Back*. The terminal reports how many files
    moved and how many bytes were freed. Click **Finish** (or press Ctrl-C) to end.

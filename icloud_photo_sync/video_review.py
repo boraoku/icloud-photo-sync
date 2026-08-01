@@ -5,10 +5,13 @@ with seek support, so ``video-clean`` runs a tiny local HTTP server (the same
 :class:`~icloud_photo_sync.review.TrashSession` machinery ``local-clean`` uses).
 
 Unlike ``local-clean`` there is no streaming/polling: the size-sorted scan is
-instant, so the full list is embedded into the page at load. The two things the
-server must do that a file:// page cannot are (1) serve each original video with
-HTTP Range support — mandatory for ``<video>`` scrubbing and required outright by
-Safari — and (2) move selected files to the Trash via Finder.
+instant, so the full list is embedded into the page at load. The three things
+the server must do that a file:// page cannot are (1) hand the grid a poster
+frame per video (see :mod:`icloud_photo_sync.poster` — drawing the grid with
+``<video>`` elements cost the browser a decoder per card), (2) serve each
+original video with HTTP Range support — mandatory for ``<video>`` scrubbing and
+required outright by Safari — and (3) move selected files to the Trash via
+Finder.
 """
 
 from __future__ import annotations
@@ -17,13 +20,13 @@ import json
 import mimetypes
 from dataclasses import dataclass
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
 from .logutil import get_logger
-from .review import TrashSession, _human_size
+from .poster import PosterCache, format_duration
+from .review import CLIENT_GONE, TrashSession, _BaseHandler, _human_size
 from .trash import TrashResult
 
 logger = get_logger(__name__)
@@ -52,6 +55,7 @@ class VideoItem:
     rel: str
     size: int
     mtime_ns: int
+    duration: float | None = None   # seconds; None when no prober could tell
 
 
 def _guess_video_type(path: Path) -> str:
@@ -94,17 +98,25 @@ def _parse_range(header: str | None, size: int):
     return start, min(end, size - 1)
 
 
-class _Handler(BaseHTTPRequestHandler):
+class _Handler(_BaseHandler):
     server_version = "VideoCleanReview/1.0"
     protocol_version = "HTTP/1.1"  # keep-alive for smooth range seeking
 
     def log_message(self, fmt, *args):  # noqa: ANN001 - quiet the default logging
         logger.debug("video-review: " + fmt, *args)
 
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
+    def _send(
+        self,
+        code: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -120,7 +132,28 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/video/"):
             self._serve_video(srv, path)
             return
+        if path.startswith("/poster/"):
+            self._serve_poster(srv, path)
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _serve_poster(self, srv: "VideoReviewServer", path: str) -> None:
+        """Serve the grid thumbnail, rendering it on this thread if it's a miss."""
+        raw = path[len("/poster/"):]
+        try:
+            n = int(raw)  # int-only: no path traversal possible
+        except ValueError:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+        data = srv.poster_bytes(n)
+        if data is None:
+            # Either still rendering (queued by poster_bytes) or unrenderable.
+            # Both answer immediately: holding the connection would stall the
+            # video the user just clicked. The page retries, then gives up.
+            self._send(404, b"not ready", "text/plain; charset=utf-8")
+            return
+        self._send(200, data, "image/jpeg",
+                   {"Cache-Control": "private, max-age=86400"})
 
     def do_HEAD(self) -> None:
         self.do_GET()
@@ -174,7 +207,7 @@ class _Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_GONE:
             pass  # browser aborted the request (normal while scrubbing)
         except OSError as exc:
             logger.debug("video stream error for %s: %s", item.rel, exc)
@@ -208,11 +241,15 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class VideoReviewServer(TrashSession):
-    """Serves the video list, streams originals with Range support, and trashes.
+    """Serves the video list, grid posters, ranged originals, and trashes.
 
     All items are known up front (the scan is instant), so the page embeds the
-    full list and there is no streaming/polling — only the range-serving of the
-    original files and the inherited :meth:`~..review.TrashSession.do_trash`.
+    full list and there is no streaming/polling — only the poster frames, the
+    range-serving of the original files and the inherited
+    :meth:`~..review.TrashSession.do_trash`.
+
+    ``posters`` may be omitted (tests, callers that don't want a cache dir); the
+    grid then falls back to placeholder tiles.
     """
 
     def __init__(
@@ -222,14 +259,35 @@ class VideoReviewServer(TrashSession):
         token: str,
         host: str = "127.0.0.1",
         port: int = 0,
+        posters: PosterCache | None = None,
     ) -> None:
         super().__init__(_Handler, trash_fn, token, host, port)
         self.items = list(items)
         self._by_index = {it.index: it for it in self.items}
+        self.posters = posters
         self.page = render_video_page(token, self.items)
 
     def item_for(self, index: int) -> VideoItem | None:
         return self._by_index.get(index)
+
+    def poster_bytes(self, index: int) -> bytes | None:
+        """Rendered poster for ``index``, or None — queueing a render on a miss.
+
+        Never blocks: see :class:`~icloud_photo_sync.poster.PosterCache`.
+        """
+        item = self.item_for(index)
+        if item is None or self.posters is None:
+            return None
+        data = self.posters.get_cached(item)
+        if data is None:
+            self.posters.request(item)
+            return None
+        return data or None          # b"" means "tried, can't be rendered"
+
+    def close(self) -> None:
+        if self.posters is not None:
+            self.posters.close()
+        super().close()
 
 
 def _item_payload(it: VideoItem) -> dict:
@@ -243,6 +301,7 @@ def _item_payload(it: VideoItem) -> dict:
         "bytes": it.size,
         "size": _human_size(it.size),
         "date": date,
+        "dur": format_duration(it.duration),
     }
 
 
@@ -290,23 +349,23 @@ _TEMPLATE = """<!doctype html>
     border: 2px solid transparent; border-radius: 10px; overflow: hidden;
     background: rgba(128,128,128,.08); cursor: pointer; display: flex;
     flex-direction: column;
+    /* Skip layout/paint for the offscreen majority of a long list. The
+       intrinsic size keeps the scrollbar honest before a card is rendered. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 190px;
   }
   .card.selected { border-color: #d13438; background: rgba(209,52,56,.10); }
   .thumb {
     position: relative; width: 100%; aspect-ratio: 16 / 10;
     background: rgba(128,128,128,.15); display: flex; overflow: hidden;
   }
-  .thumb video { width: 100%; height: 100%; object-fit: cover; display: block;
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block;
     background: #000; }
+  .thumb.noposter { background: rgba(128,128,128,.22); }
   .thumb .play {
     position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; font-size: 34px; color: #fff;
     text-shadow: 0 1px 6px rgba(0,0,0,.6); pointer-events: none;
-  }
-  .thumb .dur {
-    position: absolute; right: 6px; bottom: 6px; font-size: 11px;
-    padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,.65);
-    color: #fff; pointer-events: none;
   }
   .pick {
     position: absolute; left: 6px; top: 6px; width: 26px; height: 26px;
@@ -316,7 +375,9 @@ _TEMPLATE = """<!doctype html>
   .pick input { width: 17px; height: 17px; cursor: pointer; accent-color: #d13438; }
   .meta { padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; }
   .rel { font-size: 12px; opacity: .85; word-break: break-all; }
-  .sub { font-size: 11px; opacity: .6; }
+  .sub { font-size: 11px; opacity: .6; display: flex; gap: 8px;
+    justify-content: space-between; align-items: baseline; }
+  .sub .dur { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .done { padding: 40px 20px; text-align: center; max-width: 640px; margin: 0 auto; }
   .done h2 { font-size: 20px; }
   .fail { color: #d13438; text-align: left; }
@@ -380,12 +441,6 @@ function humanSize(n) {
     f /= 1024;
   }
 }
-function fmtDur(s) {
-  if (!isFinite(s) || s <= 0) return "";
-  s = Math.round(s);
-  const m = Math.floor(s / 60), sec = s % 60;
-  return m + ":" + String(sec).padStart(2, "0");
-}
 function totalBytes() {
   let t = 0;
   for (const i of cards.keys()) t += byIndex.get(i).bytes;
@@ -404,17 +459,6 @@ function setStatus(msg) {
   statusTimer = setTimeout(() => { el.textContent = ""; }, 4000);
 }
 
-const seen = new IntersectionObserver((entries) => {
-  for (const e of entries) {
-    if (!e.isIntersecting) continue;
-    const v = e.target;
-    seen.unobserve(v);
-    v.preload = "metadata";
-    v.src = "/video/" + v.dataset.index + "#t=0.5";  // seek to a frame for a poster
-    v.load();
-  }
-}, { rootMargin: "300px" });
-
 function addCard(it) {
   byIndex.set(it.index, it);
   const card = document.createElement("div");
@@ -423,14 +467,23 @@ function addCard(it) {
 
   const thumb = document.createElement("div");
   thumb.className = "thumb";
-  const vid = document.createElement("video");
-  vid.muted = true; vid.playsInline = true; vid.preload = "none";
-  vid.dataset.index = it.index;
-  vid.addEventListener("loadedmetadata", () => {
-    dur.textContent = fmtDur(vid.duration);
-  });
+  // A poster image costs a small bitmap; a media element per card cost a
+  // decoder and a full-resolution frame. Lazy loading fetches it near the view.
+  const shot = document.createElement("img");
+  shot.loading = "lazy";
+  shot.decoding = "async";
+  shot.alt = "";
+  shot.src = "/poster/" + it.index;
+  // A 404 means "queued, not rendered yet" as often as "can't be rendered", and
+  // an <img> can't tell them apart — so back off a few times, then settle for
+  // the placeholder tile.
+  let tries = 0;
+  shot.onerror = () => {
+    if (++tries > 6) { shot.remove(); thumb.classList.add("noposter"); return; }
+    setTimeout(() => { shot.src = "/poster/" + it.index + "?try=" + tries; },
+               Math.min(400 * tries, 2500));
+  };
   const play = document.createElement("span"); play.className = "play"; play.textContent = "▶";
-  const dur = document.createElement("span"); dur.className = "dur";
   const pick = document.createElement("label"); pick.className = "pick";
   const box = document.createElement("input"); box.type = "checkbox";
   box.onclick = (ev) => {
@@ -441,13 +494,17 @@ function addCard(it) {
   };
   pick.onclick = (ev) => ev.stopPropagation();
   pick.appendChild(box);
-  thumb.append(vid, play, dur, pick);
+  thumb.append(shot, play, pick);
 
   const meta = document.createElement("div");
   meta.className = "meta";
   const rel = document.createElement("span"); rel.className = "rel"; rel.textContent = it.rel;
   const sub = document.createElement("span"); sub.className = "sub";
-  sub.textContent = it.size + (it.date ? "  ·  " + it.date : "");
+  const facts = document.createElement("span");
+  facts.textContent = it.size + (it.date ? "  ·  " + it.date : "");
+  const dur = document.createElement("span"); dur.className = "dur";
+  dur.textContent = it.dur || "";
+  sub.append(facts, dur);
   meta.append(rel, sub);
 
   card.append(thumb, meta);
@@ -455,7 +512,6 @@ function addCard(it) {
   document.getElementById("grid").appendChild(card);
   cards.set(it.index, card);
   relToIndex.set(it.rel, it.index);
-  seen.observe(vid);
 }
 
 function updateCounts() {
@@ -477,8 +533,12 @@ function openModal(it) {
   document.getElementById("caption").textContent = it.rel + "  ·  " + it.size;
   document.getElementById("modalErr").hidden = true;
   player.src = "/video/" + it.index;
+  // closeModal() leaves the element with no source, so tell it to start
+  // loading the new one explicitly rather than relying on preload behaviour —
+  // Safari will otherwise sit on a black frame until something forces it.
+  player.load();
   modal.hidden = false;
-  player.play().catch(() => {});
+  player.play().catch(() => {});   // blocked autoplay just leaves the controls
 }
 function closeModal() {
   player.pause();

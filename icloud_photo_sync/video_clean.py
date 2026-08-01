@@ -4,9 +4,10 @@ Videos are the heaviest thing in a synced photo tree, so freeing disk space
 mostly means finding and deleting a handful of large clips. This command walks
 the tree for video files, opens a browser page listing them from largest to
 smallest, and lets the user preview any clip and move whatever they choose to
-the macOS Trash. No iCloud login, no local model, no cache — the scan is a plain
+the macOS Trash. No iCloud login and no local model — the scan is a plain
 ``stat`` walk and every deletion is the user's explicit choice (nothing is
-pre-selected).
+pre-selected). The only state kept between runs is the grid's poster-frame
+cache (:mod:`icloud_photo_sync.poster`).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import typer
 from .config import VideoCleanConfig
 from .local_clean import iter_media_files
 from .logutil import get_logger
+from .poster import PosterCache, probe_durations
 from .trash import move_to_trash
 from .video_review import VideoItem, VideoReviewServer
 
@@ -80,8 +82,12 @@ def run_video_clean(config: VideoCleanConfig) -> int:
         typer.secho("No videos found.", fg=typer.colors.GREEN)
         return 0
 
+    # Spotlight answers for the whole library in one call, so the grid can show
+    # lengths without the scan stopping being effectively instant.
+    durations = probe_durations(v.path for v in videos)
     items = [
-        VideoItem(index=i, path=v.path, rel=v.rel, size=v.size, mtime_ns=v.mtime_ns)
+        VideoItem(index=i, path=v.path, rel=v.rel, size=v.size,
+                  mtime_ns=v.mtime_ns, duration=durations.get(v.path))
         for i, v in enumerate(videos)
     ]
     size_by_rel = {v.rel: v.size for v in videos}
@@ -89,6 +95,7 @@ def run_video_clean(config: VideoCleanConfig) -> int:
     server = VideoReviewServer(
         items=items, trash_fn=move_to_trash,
         token=secrets.token_urlsafe(16), port=config.port,
+        posters=PosterCache(config.poster_cache_dir),
     )
     server.start()
     url = server.url

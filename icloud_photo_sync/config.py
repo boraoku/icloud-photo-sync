@@ -46,6 +46,9 @@ DEFAULT_LM_READ_TIMEOUT = 180.0                 # ~15s typical; headroom for col
 DEFAULT_FLAG_CATEGORIES = ("screenshot", "meme", "other")
 DEFAULT_THUMB_MAX_DIM = 1024                    # px; downscale for both LM and review
 
+# video-clean: hidden cache dir inside the photo tree (dot-dir: the scan prunes it).
+POSTER_CACHE_DIRNAME = ".icloud-photo-sync"
+
 
 def default_config_root() -> Path:
     """Per-user config/data dir. macOS: ``~/Library/Application Support``."""
@@ -201,14 +204,17 @@ class LocalCleanConfig:
 class VideoCleanConfig:
     """Configuration for the credential-free ``video-clean`` command.
 
-    Like :class:`LocalCleanConfig` this needs no Apple ID, but it also needs no
-    classification cache or vision model: the scan is a plain size-sorted walk
-    and every decision is the user's, so the only knobs are an optional
-    minimum-size floor and the review server's browser/port behaviour.
+    Like :class:`LocalCleanConfig` this needs no Apple ID, and no vision model:
+    the scan is a plain size-sorted walk and every decision is the user's, so
+    the only knobs are an optional minimum-size floor and the review server's
+    browser/port behaviour. Its one piece of state is the poster-frame cache
+    the review grid draws from, kept in a hidden directory inside the photo
+    tree so it travels with the files it describes.
     """
 
     output_root: Path
     logs_dir: Path
+    poster_cache_dir: Path
 
     min_bytes: int = 0
     port: int = 0
@@ -230,7 +236,22 @@ class VideoCleanConfig:
         for d in (config_root, logs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        cfg = cls(output_root=output_root, logs_dir=logs_dir)
+        # Posters live beside the videos they belong to — a hidden directory, so
+        # the scan (which prunes dot-dirs) never sees them, and unplugging the
+        # drive takes its cache with it. A read-only or full volume falls back
+        # to the per-user config root rather than failing the command.
+        poster_cache_dir = output_root / POSTER_CACHE_DIRNAME / "posters"
+        try:
+            poster_cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            poster_cache_dir = (
+                config_root / "cache"
+                / f"video-posters-{_clean_cache_key(output_root)}"
+            )
+            poster_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg = cls(output_root=output_root, logs_dir=logs_dir,
+                  poster_cache_dir=poster_cache_dir)
         for k, v in overrides.items():
             if not hasattr(cfg, k):
                 # Match AppConfig.create: a silently-dropped typo would run with
