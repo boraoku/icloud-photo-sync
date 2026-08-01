@@ -216,3 +216,23 @@ def test_close_is_idempotent_and_outcome_starts_empty(tmp_path):
 def test_close_without_start_does_not_hang(tmp_path):
     srv = _make_server(tmp_path, [])
     srv.close()  # never started
+
+
+def test_client_disconnect_is_quiet_but_bugs_are_reported(tmp_path, capfd):
+    srv = _make_server(tmp_path, [])
+    client = ("127.0.0.1", 54321)
+    try:
+        # handle_error() reads the live exception, so raise it for real.
+        try:
+            raise ConnectionResetError(54, "Connection reset by peer")
+        except ConnectionResetError:
+            srv._httpd.handle_error(None, client)
+        assert capfd.readouterr().err == ""
+
+        try:
+            raise ValueError("handler bug")
+        except ValueError:
+            srv._httpd.handle_error(None, client)
+        assert "handler bug" in capfd.readouterr().err
+    finally:
+        srv.close()

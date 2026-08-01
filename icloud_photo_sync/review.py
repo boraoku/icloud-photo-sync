@@ -16,6 +16,7 @@ than inlined, so the page stays light no matter how many images are flagged.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,42 @@ from .logutil import get_logger
 from .trash import TrashResult
 
 logger = get_logger(__name__)
+
+# A browser hanging up on us: aborted preload, closed tab, scrubbed-past range
+# request. Routine here, not a failure.
+CLIENT_GONE = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+
+
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """Threading server that keeps client disconnects out of the terminal.
+
+    The stdlib prints a full traceback per aborted connection, which would bury
+    the output the commands themselves write (tqdm bars, summaries). Real
+    handler bugs still surface via ``super()``.
+    """
+
+    def handle_error(self, request, client_address) -> None:  # noqa: ANN001
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_GONE):
+            logger.debug("client %s disconnected: %s", client_address, exc)
+            return
+        super().handle_error(request, client_address)
+
+
+class _BaseHandler(BaseHTTPRequestHandler):
+    """Request handler that ends the connection cleanly on a client abort.
+
+    Matters most with keep-alive (``video-clean`` speaks HTTP/1.1 so ranged
+    seeking stays fast): the thread sits blocked reading the next request when
+    the browser resets the socket, and the stdlib handles only ``TimeoutError``
+    there.
+    """
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except CLIENT_GONE:
+            self.close_connection = True
 
 
 @dataclass
@@ -74,7 +111,7 @@ def render_page(token: str) -> str:
     return _TEMPLATE.replace("__TOKEN__", token)
 
 
-class _Handler(BaseHTTPRequestHandler):
+class _Handler(_BaseHandler):
     server_version = "LocalCleanReview/1.0"
 
     def log_message(self, fmt, *args):  # noqa: ANN001 - quiet the default logging
@@ -168,7 +205,7 @@ class TrashSession:
 
     def __init__(
         self,
-        handler_cls: type[BaseHTTPRequestHandler],
+        handler_cls: type[_BaseHandler],
         trash_fn: Callable[[list[Path]], list[TrashResult]],
         token: str,
         host: str = "127.0.0.1",
@@ -186,7 +223,7 @@ class TrashSession:
         self._thread: threading.Thread | None = None
         self._closed = False
 
-        self._httpd = ThreadingHTTPServer((host, port), handler_cls)
+        self._httpd = _QuietHTTPServer((host, port), handler_cls)
         self._httpd.review = self  # type: ignore[attr-defined]
 
     @property
