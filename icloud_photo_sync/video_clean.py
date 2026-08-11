@@ -18,8 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import typer
+from tqdm import tqdm
 
-from .config import VideoCleanConfig
+from . import clean_icloud
+from .config import VIDEO_SUFFIXES, VideoCleanConfig
 from .local_clean import iter_media_files
 from .logutil import get_logger
 from .poster import PosterCache, probe_durations
@@ -28,10 +30,6 @@ from .video_review import VideoItem, VideoReviewServer
 
 logger = get_logger(__name__)
 
-VIDEO_SUFFIXES = {
-    ".mov", ".mp4", ".m4v", ".avi", ".mpg", ".mpeg", ".3gp", ".3g2",
-    ".wmv", ".webm", ".mkv", ".mts", ".m2ts",
-}
 
 
 @dataclass(frozen=True)
@@ -71,8 +69,14 @@ def scan_videos(root: Path, min_bytes: int = 0) -> list[VideoFile]:
     return found
 
 
-def run_video_clean(config: VideoCleanConfig) -> int:
-    """Execute the scan → review → trash flow. Returns an exit code."""
+def run_video_clean(config: VideoCleanConfig, icloud=None) -> int:
+    """Execute the scan → review → trash flow. Returns an exit code.
+
+    ``icloud`` is an optional :class:`~icloud_photo_sync.config.ICloudDeleteConfig`.
+    When given, the iCloud session is checked before the scan; when None, nothing
+    here touches an Apple ID at all.
+    """
+    armed = clean_icloud.arm(icloud) if icloud is not None else None
     root = config.output_root
     typer.secho(f"Scanning {root} for videos…", fg=typer.colors.BLUE)
     videos = scan_videos(root, config.min_bytes)
@@ -96,6 +100,7 @@ def run_video_clean(config: VideoCleanConfig) -> int:
         items=items, trash_fn=move_to_trash,
         token=secrets.token_urlsafe(16), port=config.port,
         posters=PosterCache(config.poster_cache_dir),
+        icloud_armed=armed is not None,
     )
     server.start()
     url = server.url
@@ -124,10 +129,18 @@ def run_video_clean(config: VideoCleanConfig) -> int:
         f"({_human_size(freed)} freed).",
         fg=typer.colors.GREEN,
     )
+    if armed is None and outcome.moved:
+        # Still in iCloud, so the next sync brings them all back.
+        typer.secho("They are still in iCloud, so the next sync will download "
+                    "them again. To delete them there too:\n"
+                    "  icloud-photo-sync icloud-delete --scan-trashed --dry-run",
+                    fg=typer.colors.YELLOW)
+    icloud_code = clean_icloud.finish_and_report(armed, outcome,
+                                                source="video-clean", progress=tqdm)
     if outcome.failed:
         typer.secho(f"{len(outcome.failed)} could not be moved:",
                     fg=typer.colors.RED, err=True)
         for rel, err in outcome.failed:
             typer.secho(f"  {rel}: {err}", fg=typer.colors.RED, err=True)
         return 1
-    return 130 if interrupted else 0
+    return icloud_code or (130 if interrupted else 0)

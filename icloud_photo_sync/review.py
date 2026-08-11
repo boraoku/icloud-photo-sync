@@ -81,6 +81,8 @@ class FlaggedItem:
 class TrashOutcome:
     moved: list[str] = field(default_factory=list)          # rel paths
     failed: list[tuple[str, str]] = field(default_factory=list)  # (rel, error)
+    icloud: list[str] = field(default_factory=list)         # subset of moved, opted in
+    sizes: dict[str, int | None] = field(default_factory=dict)   # rel → bytes when trashed
 
 
 def _human_size(n: int) -> str:
@@ -103,12 +105,18 @@ def _item_payload(it: FlaggedItem) -> dict:
     }
 
 
-def render_page(token: str) -> str:
+def render_page(token: str, icloud_armed: bool = False, retro: bool = False) -> str:
     """Return the static review shell (inline CSS/JS, no templating dep).
 
     Item data is not embedded — the page fetches it from ``/items``.
+
+    ``retro`` re-words the page for a retrospective run, where the files are
+    already gone from disk and the only effect of a selection is deletion from
+    iCloud. Every label that says "Trash" would be a lie there.
     """
-    return _TEMPLATE.replace("__TOKEN__", token)
+    return (_TEMPLATE.replace("__TOKEN__", token)
+            .replace("__ICLOUD__", "true" if icloud_armed else "false")
+            .replace("__RETRO__", "true" if retro else "false"))
 
 
 class _Handler(_BaseHandler):
@@ -179,10 +187,11 @@ class _Handler(_BaseHandler):
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length) or b"{}")
             ids = [int(i) for i in body.get("ids", [])]
+            icloud = bool(body.get("icloud", False))
         except (ValueError, TypeError):
             self._json(400, {"error": "bad request"})
             return
-        outcome = srv.do_trash(ids)
+        outcome = srv.do_trash(ids, icloud=icloud)
         self._json(200, {
             "moved": outcome.moved,
             "failed": [{"rel": r, "error": e} for r, e in outcome.failed],
@@ -210,9 +219,14 @@ class TrashSession:
         token: str,
         host: str = "127.0.0.1",
         port: int = 0,
+        icloud_armed: bool = False,
     ) -> None:
         self.trash_fn = trash_fn
         self.token = token
+        # Authorised in the terminal, before the browser ever opened. The page
+        # can only narrow this (see do_trash): a page holding the loopback token
+        # must never be able to cause a deletion the terminal did not allow.
+        self.icloud_armed = icloud_armed
 
         self._lock = threading.Lock()
         self._by_index: dict[int, object] = {}
@@ -267,11 +281,16 @@ class TrashSession:
             return {
                 "moved": list(self.outcome.moved),
                 "failed": [{"rel": r, "error": e} for r, e in self.outcome.failed],
+                "icloud_armed": self.icloud_armed,
+                "icloud": len(self.outcome.icloud),
             }
 
     # --- trash application ---------------------------------------------------
 
-    def do_trash(self, ids: Sequence[int]) -> TrashOutcome:
+    def do_trash(self, ids: Sequence[int], *, icloud: bool | None = None) -> TrashOutcome:
+        # The page may decline iCloud deletion for this round, never enable it.
+        want_icloud = self.icloud_armed and (True if icloud is None else bool(icloud))
+
         # (a) Under lock: resolve ids, skip unknown/already-trashed, mark trashed
         # up front so a concurrent/double POST resolves those ids to nothing.
         with self._lock:
@@ -281,6 +300,15 @@ class TrashSession:
                 if i in self._by_index and i not in self._trashed
             ]
             self._trashed.update(it.index for it in wanted)
+
+        # Measure now, not at scan time: a local-clean session classifies for
+        # hours, and this size is the evidence any remote deletion rests on.
+        sizes: dict[str, int | None] = {}
+        for it in wanted:
+            try:
+                sizes[it.rel] = it.path.stat().st_size
+            except OSError:
+                sizes[it.rel] = None
 
         # (b) OUTSIDE the lock: trashing shells out to Finder and can take
         # minutes for a big selection — holding the lock would stall publish().
@@ -303,6 +331,20 @@ class TrashSession:
                 self._trashed.discard(idx)
             self.outcome.moved += round_outcome.moved
             self.outcome.failed += round_outcome.failed
+            # Only files that actually left the disk are candidates for anything
+            # further, so sizes and the iCloud queue follow `moved`.
+            for rel in round_outcome.moved:
+                self.outcome.sizes[rel] = sizes.get(rel)
+            if want_icloud:
+                self.outcome.icloud += round_outcome.moved
+
+        # The only durable record of *which* files a session trashed. Without
+        # it, an unarmed session leaves nothing but the absence of the files
+        # themselves, and reconstructing it later (see retro_clean) is far more
+        # work than one log line.
+        if round_outcome.moved:
+            logger.debug("trashed %d file(s): %s", len(round_outcome.moved),
+                         ", ".join(round_outcome.moved))
         return round_outcome
 
 
@@ -321,10 +363,12 @@ class ReviewServer(TrashSession):
         token: str,
         host: str = "127.0.0.1",
         port: int = 0,
+        icloud_armed: bool = False,
+        retro: bool = False,
     ) -> None:
-        super().__init__(_Handler, trash_fn, token, host, port)
+        super().__init__(_Handler, trash_fn, token, host, port, icloud_armed)
         self.thumbs_dir = Path(thumbs_dir)
-        self.page = render_page(token)
+        self.page = render_page(token, icloud_armed, retro)
 
         self._items: list[FlaggedItem] = []
         self._classified = 0
@@ -408,6 +452,13 @@ _TEMPLATE = """<!doctype html>
   }
   button.danger:hover { background: #b02a2e; }
   .chip { font-size: 12px; padding: 4px 10px; }
+  .icloud {
+    font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px;
+    background: rgba(209,52,56,.14); color: #d13438; border: 1px solid rgba(209,52,56,.4);
+  }
+  .icloud-pick { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .icloud-pick input { accent-color: #d13438; }
+  [hidden] { display: none !important; }
   .grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
     gap: 12px; padding: 16px;
@@ -437,7 +488,11 @@ _TEMPLATE = """<!doctype html>
   <span class="count" id="count">Loading…</span>
   <span class="prog" id="progress"></span>
   <span id="status"></span>
+  <span class="icloud" id="icloudBanner" hidden>iCloud deletion armed</span>
   <span class="spacer"></span>
+  <label class="icloud-pick" id="icloudPick" hidden>
+    <input type="checkbox" id="icloudBox" checked> Also delete from iCloud
+  </label>
   <span id="chips"></span>
   <button id="all">Select all</button>
   <button id="none">Deselect all</button>
@@ -447,6 +502,8 @@ _TEMPLATE = """<!doctype html>
 <main id="main"><div class="grid" id="grid"></div></main>
 <script>
 const TOKEN = "__TOKEN__";
+const ICLOUD_ARMED = __ICLOUD__;   // authorised in the terminal, not here
+const RETRO = __RETRO__;           // files already gone; iCloud is the only effect
 const cards = new Map();        // index -> card element
 const relToIndex = new Map();   // rel -> index
 const selected = new Set();     // selected indices (checked = will be trashed)
@@ -497,7 +554,9 @@ function updateCounts() {
     done ? (cards.size + " flagged — classification complete")
          : ("Classifying… " + lastClassified + "/" + lastTotal);
   const btn = document.getElementById("trash");
-  btn.textContent = "Move " + selected.size + " to Trash";
+  btn.textContent = RETRO
+    ? "Delete " + selected.size + " from iCloud"
+    : "Move " + selected.size + " to Trash";
   btn.disabled = selected.size === 0;
 }
 
@@ -553,17 +612,35 @@ async function poll() {
   setTimeout(poll, 2500);
 }
 
+function wantsICloud() {
+  const box = document.getElementById("icloudBox");
+  // A retrospective run has no local effect at all, so opting out of iCloud
+  // would mean doing nothing — the checkbox is hidden and the answer is yes.
+  if (RETRO) return ICLOUD_ARMED;
+  return ICLOUD_ARMED && !!box && box.checked;
+}
+
 async function doTrash() {
   if (!selected.size) return;
-  if (!confirm("Move " + selected.size + " file(s) to the Trash?")) return;
+  const alsoICloud = wantsICloud();
+  const question = RETRO
+    ? "Select " + selected.size + " file(s) for deletion from iCloud?\\n\\n"
+      + "These are already gone from your disk. You will confirm in the terminal "
+      + "before anything is deleted."
+    : alsoICloud
+    ? "Move " + selected.size + " file(s) to the Trash AND queue them for deletion "
+      + "from iCloud?\\n\\nYou will confirm the iCloud part in the terminal before "
+      + "anything is deleted there."
+    : "Move " + selected.size + " file(s) to the Trash?";
+  if (!confirm(question)) return;
   const btn = document.getElementById("trash");
-  btn.disabled = true; btn.textContent = "Moving…";
+  btn.disabled = true; btn.textContent = RETRO ? "Selecting…" : "Moving…";
   const ids = [...selected];
   try {
     const resp = await fetch("/trash", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Clean-Token": TOKEN },
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify({ ids, icloud: alsoICloud }),
     });
     const data = await resp.json();
     for (const rel of (data.moved || [])) {
@@ -580,7 +657,9 @@ async function doTrash() {
     const nFailed = (data.failed || []).length;
     buildChips();
     updateCounts();
-    setStatus("Moved " + nMoved + " to Trash" + (nFailed ? " — " + nFailed + " failed" : ""));
+    setStatus((RETRO ? "Selected " + nMoved + " for iCloud deletion"
+                     : "Moved " + nMoved + " to Trash")
+              + (nFailed ? " — " + nFailed + " failed" : ""));
     if (done && cards.size === 0) { finishSession(); return; }
   } catch (e) {
     setStatus("Trash failed: " + e);
@@ -614,7 +693,9 @@ function showDone(data) {
   const div = document.createElement("div");
   div.className = "done";
   const h = document.createElement("h2");
-  h.textContent = "Moved " + moved + " file(s) to the Trash.";
+  h.textContent = RETRO
+    ? "Selected " + moved + " file(s) for deletion from iCloud."
+    : "Moved " + moved + " file(s) to the Trash.";
   div.appendChild(h);
   if (failed.length) {
     const p = document.createElement("p"); p.className = "fail";
@@ -627,6 +708,12 @@ function showDone(data) {
       ul.appendChild(li);
     }
     div.appendChild(ul);
+  }
+  if (data.icloud_armed && data.icloud) {
+    const p1 = document.createElement("p");
+    p1.textContent = data.icloud + " file(s) are queued for deletion from iCloud — "
+      + "go back to the terminal to confirm. Nothing has been deleted from iCloud yet.";
+    div.appendChild(p1);
   }
   const p2 = document.createElement("p");
   p2.textContent = "You can close this tab. The command has finished.";
@@ -675,6 +762,17 @@ document.getElementById("trash").onclick = doTrash;
 document.getElementById("finish").onclick = () => {
   if (confirm("Finish the review session and exit the command?")) finishSession();
 };
+
+if (ICLOUD_ARMED) {
+  const banner = document.getElementById("icloudBanner");
+  banner.hidden = false;
+  if (RETRO) {
+    banner.textContent = "iCloud deletion — local copies already gone";
+    document.title = "Retrospective iCloud deletion";
+  } else {
+    document.getElementById("icloudPick").hidden = false;
+  }
+}
 
 updateCounts();
 poll();

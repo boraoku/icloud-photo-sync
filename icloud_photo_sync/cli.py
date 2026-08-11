@@ -13,12 +13,20 @@ from threading import Event
 from typing import Optional
 
 import typer
+from tqdm import tqdm
 
+from . import clean_icloud
 from . import config as cfg
 from . import icloud_client as ic
 from .auth import SessionManager
 from .classifier import CATEGORIES
-from .config import MIN_WATCH_INTERVAL, AppConfig, LocalCleanConfig, VideoCleanConfig
+from .config import (
+    MIN_WATCH_INTERVAL,
+    AppConfig,
+    ICloudDeleteConfig,
+    LocalCleanConfig,
+    VideoCleanConfig,
+)
 from .downloader import Downloader
 from .local_clean import run_local_clean, _parse_size
 from .video_clean import run_video_clean
@@ -96,6 +104,28 @@ def _build_config(ctx: typer.Context, **overrides) -> AppConfig:
         if ic.clear_engine_credentials(apple_id):
             typer.secho("Cleared pyicloud's keychain entry as well.", fg=typer.colors.YELLOW)
     return config
+
+
+def _build_icloud_delete(
+    ctx: typer.Context, output_root: Path, *, enabled: bool, **overrides
+) -> "ICloudDeleteConfig | None":
+    """Resolve the Apple ID only when the user opted in.
+
+    This call site *is* the credential-free contract: without --icloud-delete no
+    Apple ID is resolved, no Keychain is read and no network is touched.
+    """
+    if not enabled:
+        flags = {"dry_run": "--icloud-dry-run", "max_delete": "--max-delete"}
+        bad = [flags.get(name, f"--{name.replace('_', '-')}")
+               for name, value in overrides.items() if value]
+        if bad:
+            raise typer.BadParameter(
+                f"{bad[0]} only means something together with --icloud-delete."
+            )
+        return None
+    octx: AppContext = ctx.obj
+    apple_id = cfg.resolve_username(octx.username) or typer.prompt("Apple ID (email)")
+    return ICloudDeleteConfig.create(apple_id, output_root, **overrides)
 
 
 def _fail(message: str, code: int) -> None:
@@ -294,8 +324,18 @@ def local_clean(
     no_browser: bool = typer.Option(
         False, "--no-browser", help="Print the review URL instead of opening a browser."
     ),
+    icloud_delete: bool = typer.Option(
+        False, "--icloud-delete",
+        help="Also offer to delete trashed files from iCloud (asks before doing it).",
+    ),
+    icloud_dry_run: bool = typer.Option(
+        False, "--icloud-dry-run", help="Show what would be deleted from iCloud, delete nothing."
+    ),
+    max_delete: Optional[int] = typer.Option(
+        None, "--max-delete", help="Cap iCloud deletions per run (default 500)."
+    ),
 ) -> None:
-    """Find small screenshots/memes locally, review them, move to Trash. No iCloud login."""
+    """Find small screenshots/memes locally, review them, move to Trash. No iCloud login unless --icloud-delete."""
     octx: AppContext = ctx.obj
     output_root = (octx.directory or Path.cwd()).resolve()
 
@@ -319,7 +359,9 @@ def local_clean(
         verbose=octx.verbose,
     )
     setup_logging(config.logs_dir, config.verbose)
-    raise typer.Exit(run_local_clean(config))
+    icloud = _build_icloud_delete(ctx, output_root, enabled=icloud_delete,
+                                  dry_run=icloud_dry_run, max_delete=max_delete)
+    raise typer.Exit(run_local_clean(config, icloud))
 
 
 @app.command("video-clean")
@@ -332,8 +374,18 @@ def video_clean(
     no_browser: bool = typer.Option(
         False, "--no-browser", help="Print the review URL instead of opening a browser."
     ),
+    icloud_delete: bool = typer.Option(
+        False, "--icloud-delete",
+        help="Also offer to delete trashed videos from iCloud (asks before doing it).",
+    ),
+    icloud_dry_run: bool = typer.Option(
+        False, "--icloud-dry-run", help="Show what would be deleted from iCloud, delete nothing."
+    ),
+    max_delete: Optional[int] = typer.Option(
+        None, "--max-delete", help="Cap iCloud deletions per run (default 500)."
+    ),
 ) -> None:
-    """List downloaded videos largest-first, preview them, move selections to Trash. No iCloud login."""
+    """List downloaded videos largest-first, preview them, move selections to Trash. No iCloud login unless --icloud-delete."""
     octx: AppContext = ctx.obj
     output_root = (octx.directory or Path.cwd()).resolve()
 
@@ -345,7 +397,100 @@ def video_clean(
         verbose=octx.verbose,
     )
     setup_logging(config.logs_dir, config.verbose)
-    raise typer.Exit(run_video_clean(config))
+    icloud = _build_icloud_delete(ctx, output_root, enabled=icloud_delete,
+                                  dry_run=icloud_dry_run, max_delete=max_delete)
+    raise typer.Exit(run_video_clean(config, icloud))
+
+
+@app.command("icloud-delete")
+def icloud_delete_cmd(
+    ctx: typer.Context,
+    from_manifest: Optional[Path] = typer.Option(
+        None, "--from", metavar="MANIFEST",
+        help="Apply a deletion manifest written by a clean session.",
+    ),
+    last: bool = typer.Option(
+        False, "--last", help="Use the newest manifest for this Apple ID and folder."
+    ),
+    explain: Optional[Path] = typer.Option(
+        None, "--explain", metavar="RECEIPT",
+        help="Read-only: report the current iCloud state of everything in a receipt.",
+    ),
+    scan_trashed: bool = typer.Option(
+        False, "--scan-trashed",
+        help="Reconcile the folder against the manifest and offer files trashed "
+             "by an earlier session that ran without --icloud-delete.",
+    ),
+    max_size: str = typer.Option(
+        "1MB", "--max-size",
+        help="--scan-trashed: the --max-size those local-clean sessions used.",
+    ),
+    min_size: str = typer.Option(
+        "0", "--min-size",
+        help="--scan-trashed: the --min-size those video-clean sessions used.",
+    ),
+    corroborate_root: Optional[list[Path]] = typer.Option(
+        None, "--corroborate-root", metavar="DIR",
+        help="--scan-trashed: another copy of this library; anything still there "
+             "at the same size is left alone. Repeatable.",
+    ),
+    no_review: bool = typer.Option(
+        False, "--no-review",
+        help="--scan-trashed: skip the thumbnail review and rely on the evidence "
+             "gates alone.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be deleted, delete nothing."
+    ),
+    max_delete: Optional[int] = typer.Option(
+        None, "--max-delete", help="Cap deletions per confirmed batch (default 500)."
+    ),
+) -> None:
+    """Finish (or retry) deleting already-trashed files from iCloud.
+
+    A clean session writes its manifest before touching iCloud, so an expired
+    session, a dropped connection or a Ctrl-C never loses the work: come back
+    here with --last. Anything already deleted is skipped, so re-running only
+    retries what did not land.
+
+    --scan-trashed covers the other case: files trashed by a session that never
+    armed iCloud deletion at all, so no manifest exists. That evidence is weaker
+    — the file was gone before this ran, so its size could not be measured — and
+    the run refuses outright unless the whole reconstruction holds together.
+    Start with --dry-run.
+    """
+    octx: AppContext = ctx.obj
+    output_root = (octx.directory or Path.cwd()).resolve()
+    if not (from_manifest or last or explain or scan_trashed):
+        raise typer.BadParameter(
+            "pass --from MANIFEST, --last, --explain RECEIPT, or --scan-trashed.")
+    if scan_trashed and (from_manifest or last or explain):
+        raise typer.BadParameter(
+            "--scan-trashed builds its own plan; it cannot be combined with "
+            "--from, --last or --explain.")
+
+    icloud = _build_icloud_delete(ctx, output_root, enabled=True,
+                                  dry_run=dry_run, max_delete=max_delete)
+    setup_logging(icloud.app.logs_dir, octx.verbose)
+    try:
+        if explain:
+            raise typer.Exit(clean_icloud.explain_receipt(icloud, explain))
+        if scan_trashed:
+            raise typer.Exit(clean_icloud.run_retro(
+                icloud,
+                max_bytes=_parse_size(max_size),
+                min_bytes=_parse_size(min_size),
+                corroborate_roots=[p.resolve() for p in (corroborate_root or [])],
+                no_review=no_review,
+                progress=tqdm,
+            ))
+        raise typer.Exit(clean_icloud.run_from_manifest(icloud, from_manifest))
+    except AccountPreconditionError as exc:
+        _fail(str(exc), 2)
+    except SessionExpiredError as exc:
+        _fail(str(exc), 3)
+    except ICloudSyncError as exc:
+        _fail(str(exc), 1)
 
 
 def _print_stats(stats) -> None:

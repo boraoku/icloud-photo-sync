@@ -29,15 +29,32 @@ relies on, established by reading the installed source:
   still indexing AND for a missing ``ckdatabasews`` webservice ("Webservice not
   available"), which is the Advanced-Data-Protection / web-access-off symptom —
   the two must be told apart by message.
+
+This module is also the **only** one that mutates anything in iCloud (see
+:meth:`ICloudClient.delete_assets`). Two more verified 2.6.5 facts govern that:
+
+* ``PhotoAsset.delete()`` issues the modify and then ``return True``
+  unconditionally, discarding the response — a per-record CloudKit failure
+  (a stale ``recordChangeTag``, say) is indistinguishable from success. We
+  therefore never call it, and build the ``records/modify`` operation here so
+  the per-record outcome can be read, and re-checked afterwards.
+* ``album.get(id)`` runs a targeted ``recordName EQUALS`` query but falls back
+  to enumerating the whole album on a miss (``_get_photo``), so one stale id
+  would walk 25k assets. Lookups here go through ``records/lookup`` instead,
+  which is batched and cannot degrade that way.
+
+Deletion sets ``isDeleted = 1``: iCloud's "Recently Deleted", recoverable for
+~30 days. The permanent state is ``isExpunged``, which this tool never writes.
 """
 
 from __future__ import annotations
 
 import re
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from threading import Event
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import requests
 from pyicloud import PyiCloudService
@@ -52,12 +69,27 @@ from pyicloud.exceptions import (
     PyiCloudServiceNotActivatedException,
     PyiCloudServiceUnavailable,
 )
+from pyicloud.common.cloudkit.models import (
+    CKErrorItem,
+    CKModifyOperation,
+    CKRecord,
+    CKWriteRecord,
+    CKZoneID,
+    CKZoneIDReq,
+)
 from pyicloud.services.photos import (
     DirectionEnum,
     ListTypeEnum,
     ObjectTypeEnum,
     SmartAlbumEnum,
     SmartPhotoAlbum,
+)
+from pyicloud.services.photos_cloudkit.mappers import (
+    decode_encrypted_text,
+    record_change_tag,
+    record_field_value,
+    record_name,
+    record_zone,
 )
 from pyicloud.utils import delete_password_in_keyring
 
@@ -100,6 +132,115 @@ _AUTH_REQUIRED_CODES = {421, 450}
 _TRANSIENT_CODES = {429, 500, 502, 503, 504}
 
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-")
+
+# --- deletion ----------------------------------------------------------------
+
+_PRIMARY_ZONE = {"zoneName": "PrimarySync", "zoneType": "REGULAR_CUSTOM_ZONE"}
+_SHARED_ZONE_PREFIX = "SharedSync-"   # a shared library: someone else's photos too
+_LOOKUP_CHUNK = 100                   # record names per records/lookup
+
+# Only what the corroboration checks need — asking for resource blobs would drag
+# megabytes across the wire for a few hundred records.
+_ASSET_KEYS = ["recordName", "recordType", "recordChangeTag", "masterRef",
+               "assetDate", "isDeleted", "isExpunged", "zoneID"]
+# resJPEGThumbRes is a URL token, not a blob — a few hundred bytes per record —
+# so asking for it costs nothing and lets a retrospective run show the user what
+# they are about to delete, even though the local file is long gone.
+_MASTER_KEYS = ["recordName", "recordType", "filenameEnc", "resOriginalRes",
+                "resJPEGThumbRes"]
+
+
+@dataclass(frozen=True)
+class RemoteAsset:
+    """What iCloud currently says about one asset.
+
+    Carries the ``change_tag`` it was read with: a modify must quote a tag only
+    seconds old, because a stale one is what CloudKit rejects.
+    """
+
+    asset_id: str
+    record_type: str
+    change_tag: str | None
+    zone: dict
+    filename: str | None
+    size: int | None
+    capture_dt: datetime | None
+    is_deleted: bool
+    is_expunged: bool
+    thumb_url: str | None = None
+
+    @property
+    def zone_name(self) -> str:
+        return str(self.zone.get("zoneName") or "")
+
+    @property
+    def in_shared_library(self) -> bool:
+        """Shared-library assets belong to other people too — never deleted."""
+        return self.zone_name.startswith(_SHARED_ZONE_PREFIX)
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    asset_id: str
+    ok: bool
+    error: str | None = None
+    already_deleted: bool = False
+
+
+def _truthy(value) -> bool:
+    """CloudKit spells booleans as INT64 0/1."""
+    return bool(value) and value not in ("0", 0)
+
+
+def _master_ref(record: CKRecord) -> str | None:
+    """The CPLMaster record name an asset points at."""
+    value = record_field_value(record, "masterRef")
+    if isinstance(value, dict):
+        return value.get("recordName")
+    return getattr(value, "recordName", None)
+
+
+def _original_size(master: CKRecord | None) -> int | None:
+    if master is None:
+        return None
+    token = record_field_value(master, "resOriginalRes")
+    if isinstance(token, dict):
+        return token.get("size")
+    return getattr(token, "size", None)
+
+
+def _thumb_url(master: CKRecord | None) -> str | None:
+    """The CDN URL of iCloud's own JPEG thumbnail, if the master carries one."""
+    if master is None:
+        return None
+    token = record_field_value(master, "resJPEGThumbRes")
+    if isinstance(token, dict):
+        return token.get("downloadURL")
+    return getattr(token, "downloadURL", None)
+
+
+def _asset_date(record: CKRecord) -> datetime | None:
+    value = record_field_value(record, "assetDate")
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        return _dt_or_none(datetime.fromtimestamp(value / 1000.0, timezone.utc))
+    return None
+
+
+def _remote_asset(record: CKRecord, master: CKRecord | None) -> RemoteAsset:
+    return RemoteAsset(
+        asset_id=record_name(record),
+        record_type=record.recordType,
+        change_tag=record_change_tag(record),
+        zone=record_zone(record) or dict(_PRIMARY_ZONE),
+        filename=decode_encrypted_text(master, "filenameEnc") if master is not None else None,
+        size=_original_size(master),
+        capture_dt=_asset_date(record),
+        is_deleted=_truthy(record_field_value(record, "isDeleted")),
+        is_expunged=_truthy(record_field_value(record, "isExpunged")),
+        thumb_url=_thumb_url(master),
+    )
 
 
 def _exc_text(exc: Exception) -> str:
@@ -243,6 +384,19 @@ def validate_verification_code(service: PyiCloudService, device: dict, code: str
 
 def account_name(service: PyiCloudService) -> str:
     return getattr(service, "account_name", "") or ""
+
+
+def account_dsid(service: PyiCloudService) -> str:
+    """Apple's numeric id for the signed-in account.
+
+    The ground truth for *whose library am I about to mutate*: cookies are kept
+    per Apple ID, but the dsid is what the server itself resolved the session to.
+    """
+    data = getattr(service, "data", None) or {}
+    dsid = (data.get("dsInfo") or {}).get("dsid")
+    if not dsid:
+        dsid = (getattr(service, "params", None) or {}).get("dsid")
+    return str(dsid or "")
 
 
 def clear_engine_credentials(apple_id: str) -> bool:
@@ -511,3 +665,202 @@ class ICloudClient:
         range_ok = byte_offset > 0 and status == 206
         total = self._total_size(resp, byte_offset, status)
         return resp, range_ok, total
+
+    # -- deletion (the only mutation this program performs) --------------------
+
+    def supports_delete(self) -> bool:
+        """True when this pyicloud build exposes the typed CloudKit client.
+
+        Probed before the user is allowed to trash anything, so engine drift is
+        an honest up-front refusal rather than a surprise after the work is
+        done. There is deliberately no fallback to ``PhotoAsset.delete()``:
+        that path cannot report whether it worked.
+        """
+        # A session or account problem is NOT "this build cannot delete" — saying
+        # so would send the user off fixing the wrong thing, so _photos() raises
+        # a mapped error rather than being swallowed into a False here.
+        client = getattr(self._photos(), "_private_client", None)
+        return all(callable(getattr(client, name, None)) for name in ("lookup", "modify"))
+
+    def _photos(self):
+        """``service.photos``, with pyicloud's errors translated to ours.
+
+        Reaching this attribute can trigger a PCS (Protected Cloud Storage)
+        request, so it fails for session reasons far more often than for
+        engine-capability reasons — the caller's exit code depends on telling
+        those apart.
+        """
+        try:
+            return self._service.photos
+        except PyiCloudException as exc:
+            raise map_api_error(exc) from exc
+
+    def _private_client(self):
+        client = getattr(self._photos(), "_private_client", None)
+        if client is None:
+            raise ICloudSyncError(
+                "This pyicloud build exposes no CloudKit client; deletion is unavailable."
+            )
+        return client
+
+    def _zone(self) -> tuple[dict, CKZoneIDReq]:
+        """The library's private zone, as both a dict (records) and a request."""
+        library = getattr(self._photos(), "_root_library", None)
+        zone = dict(getattr(library, "zone_id", None) or _PRIMARY_ZONE)
+        return zone, CKZoneIDReq(
+            zoneName=zone["zoneName"],
+            ownerRecordName=zone.get("ownerRecordName"),
+            zoneType=zone.get("zoneType"),
+        )
+
+    def lookup_assets(
+        self, asset_ids: Sequence[str], *, chunk: int = _LOOKUP_CHUNK
+    ) -> tuple[dict[str, RemoteAsset], list[str]]:
+        """Fetch what iCloud currently says about each asset id.
+
+        Returns ``({asset_id: RemoteAsset}, missing_ids)``. Two batched round
+        trips per chunk: the CPLAsset records, then the CPLMaster records they
+        point at — filename and original size live on the *master*, so an asset
+        lookup alone could not corroborate either.
+        """
+        client = self._private_client()
+        _, zone_req = self._zone()
+        found: dict[str, RemoteAsset] = {}
+        missing: list[str] = []
+
+        ids = list(asset_ids)
+        for start in range(0, len(ids), chunk):
+            batch = ids[start:start + chunk]
+            assets, absent = self._lookup_records(client, zone_req, batch, _ASSET_KEYS)
+            missing.extend(absent)
+            masters, _ = self._lookup_records(
+                client, zone_req,
+                [m for m in (_master_ref(r) for r in assets.values()) if m],
+                _MASTER_KEYS,
+            )
+            for asset_id, record in assets.items():
+                found[asset_id] = _remote_asset(record, masters.get(_master_ref(record) or ""))
+        return found, missing
+
+    def thumbnail_bytes(self, url: str, *, max_bytes: int = 2 * 1024 * 1024) -> bytes | None:
+        """Fetch one iCloud thumbnail. Returns None rather than raising.
+
+        A thumbnail that will not load is a cosmetic problem in a review page,
+        never a reason to abandon a run — the item simply shows without one.
+        ``max_bytes`` is a sanity bound: these are tens of KB, so anything
+        larger means the URL is not what we think it is.
+        """
+        try:
+            resp = self._get_raw(url, None)
+            if getattr(resp, "status_code", 0) != 200:
+                return None
+            data = resp.raw.read(max_bytes + 1) if hasattr(resp, "raw") else resp.content
+        except (TransientError, ICloudSyncError, OSError) as exc:
+            logger.debug("thumbnail fetch failed for %s: %s", url[:80], exc)
+            return None
+        if not data or len(data) > max_bytes:
+            return None
+        return data
+
+    def _lookup_records(
+        self, client, zone_req: CKZoneIDReq, record_names: Sequence[str], keys: list[str]
+    ) -> tuple[dict[str, CKRecord], list[str]]:
+        """One ``records/lookup``. Tombstones and NOT_FOUND count as missing."""
+        if not record_names:
+            return {}, []
+        try:
+            resp = client.lookup(
+                record_names=list(record_names), zone_id=zone_req, desired_keys=keys
+            )
+        except PyiCloudException as exc:
+            raise map_api_error(exc) from exc
+        records: dict[str, CKRecord] = {}
+        missing: list[str] = []
+        for entry in getattr(resp, "records", []) or []:
+            if isinstance(entry, CKRecord):
+                records[entry.recordName] = entry
+            elif isinstance(entry, CKErrorItem):
+                if entry.recordName:
+                    missing.append(entry.recordName)
+                    logger.debug("lookup: %s -> %s", entry.recordName, entry.serverErrorCode)
+            else:  # tombstone: the record is gone entirely
+                name = getattr(entry, "recordName", None)
+                if name:
+                    missing.append(name)
+        return records, missing
+
+    def delete_assets(self, assets: Sequence[RemoteAsset]) -> list[DeleteResult]:
+        """Move ``assets`` to Recently Deleted, reporting each one honestly.
+
+        Callers pass records straight from :meth:`lookup_assets` — the change
+        tag must be seconds old, since a stale one is exactly what CloudKit
+        rejects. ``atomic=False`` so one bad record cannot veto the batch and
+        every outcome is attributable.
+
+        A response saying "fine" is not evidence: the caller must still call
+        :meth:`verify_deleted`.
+        """
+        if not assets:
+            return []
+        client = self._private_client()
+        zone_dict, zone_req = self._zone()
+
+        operations = []
+        for asset in assets:
+            zone = asset.zone or zone_dict
+            operations.append(
+                CKModifyOperation(
+                    operationType="update",
+                    record=CKWriteRecord(
+                        recordName=asset.asset_id,
+                        recordType=asset.record_type,
+                        recordChangeTag=asset.change_tag,
+                        fields={"isDeleted": {"type": "INT64", "value": 1}},
+                        zoneID=CKZoneID(**zone),
+                    ),
+                )
+            )
+        try:
+            resp = client.modify(operations=operations, zone_id=zone_req, atomic=False)
+        except PyiCloudException as exc:
+            raise map_api_error(exc) from exc
+
+        outcomes: dict[str, DeleteResult] = {}
+        for entry in getattr(resp, "records", []) or []:
+            if isinstance(entry, CKErrorItem):
+                name = entry.recordName or ""
+                outcomes[name] = DeleteResult(
+                    asset_id=name, ok=False,
+                    error=f"{entry.serverErrorCode}: {entry.reason or 'no reason given'}",
+                )
+            elif isinstance(entry, CKRecord):
+                applied = _truthy(record_field_value(entry, "isDeleted"))
+                outcomes[entry.recordName] = DeleteResult(
+                    asset_id=entry.recordName, ok=applied,
+                    error=None if applied else "server did not apply isDeleted",
+                )
+            else:  # tombstone — gone rather than trashed, but gone
+                name = getattr(entry, "recordName", "")
+                outcomes[name] = DeleteResult(asset_id=name, ok=True, already_deleted=True)
+
+        return [
+            outcomes.get(
+                a.asset_id,
+                DeleteResult(asset_id=a.asset_id, ok=False,
+                             error="no per-record outcome in the response"),
+            )
+            for a in assets
+        ]
+
+    def verify_deleted(self, asset_ids: Sequence[str]) -> dict[str, bool]:
+        """Re-read each asset and report whether iCloud really has it deleted.
+
+        This is the only thing that turns "the API accepted it" into "it
+        happened". An id that has vanished entirely counts as deleted.
+        """
+        found, missing = self.lookup_assets(asset_ids)
+        verified = {asset_id: True for asset_id in missing}
+        for asset_id in asset_ids:
+            if asset_id in found:
+                verified[asset_id] = found[asset_id].is_deleted or found[asset_id].is_expunged
+        return verified

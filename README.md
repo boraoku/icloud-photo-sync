@@ -7,10 +7,15 @@ Photos library** into the current folder, organised by capture date:
 ./YYYY/MM/<filename>      e.g.  ./2026/07/IMG_1234.HEIC
 ```
 
-It is **one-way only** — it downloads and adds, and **never deletes or modifies**
-anything, locally or in iCloud. You can stop it any time and resume; interrupted
-files (large videos) resume at the byte level when the server allows it, and it
-can keep the folder up to date by pulling only newly-added items.
+Syncing is **one-way only** — it downloads and adds, and **never deletes or
+modifies** anything, locally or in iCloud. You can stop it any time and resume;
+interrupted files (large videos) resume at the byte level when the server allows
+it, and it can keep the folder up to date by pulling only newly-added items.
+
+The clean-up commands are the one exception, and only when you ask for them:
+`local-clean` and `video-clean` move files you pick to the macOS Trash, and with
+`--icloud-delete` they can also move the matching iCloud assets to *Recently
+Deleted* — after showing you exactly what matched and asking you to confirm.
 
 > Mental model: **`sync` = start · Ctrl-C = stop · `sync` again = resume ·
 > `sync --watch N` = stay current.**
@@ -108,7 +113,16 @@ icloud-photo-sync [GLOBAL] status
 icloud-photo-sync [GLOBAL] local-clean [--max-size SIZE] [--lm-url URL]
                                        [--lm-model NAME] [--flag CATS]
                                        [--limit N] [--reclassify] [--no-browser]
+                                       [--icloud-delete] [--icloud-dry-run]
+                                       [--max-delete N]
 icloud-photo-sync [GLOBAL] video-clean [--min-size SIZE] [--port N] [--no-browser]
+                                       [--icloud-delete] [--icloud-dry-run]
+                                       [--max-delete N]
+icloud-photo-sync [GLOBAL] icloud-delete (--last | --from MANIFEST | --explain RECEIPT
+                                        | --scan-trashed)
+                                       [--dry-run] [--max-delete N]
+                                       [--max-size SIZE] [--min-size SIZE]
+                                       [--corroborate-root DIR] [--no-review]
 
 GLOBAL options:
   -u, --username APPLE_ID   Apple ID (else $ICLOUD_SYNC_USERNAME, else prompt)
@@ -133,9 +147,14 @@ GLOBAL options:
 * **`video-clean`** — list downloaded videos largest-first, preview any of them
   in the browser, and move the ones you choose to the Trash to reclaim space. No
   iCloud login and no model required. See the section below.
+* **`icloud-delete`** — finish or retry deleting already-trashed files from
+  iCloud, using the manifest a clean session wrote; or `--scan-trashed` to
+  reconstruct a session that ran before the flag existed. See *Deleting from
+  iCloud too*.
 
 Exit codes: `2` = account precondition problem, `3` = session expired (run
-`login`), `4` = must accept Apple terms, `1` = other error.
+`login`), `4` = must accept Apple terms, `5` = a deletion could not be verified
+(nothing further was attempted), `1` = other error.
 
 ---
 
@@ -179,6 +198,9 @@ model, start its local server, and leave the defaults. Point elsewhere with
 --limit N          Classify at most N new images this run (resume later).
 --reclassify       Ignore the cache and re-classify everything.
 --no-browser       Print the review URL instead of opening a browser.
+--icloud-delete    Also offer to delete the trashed images from iCloud.
+--icloud-dry-run   Show what would be deleted from iCloud; delete nothing.
+--max-delete N     Cap iCloud deletions for this run (default 500).
 ```
 
 **First run trashes via Finder**, so macOS shows a one-time prompt asking to let
@@ -220,12 +242,132 @@ How it works:
 
 ```
 --min-size SIZE    Only list videos at or above this (e.g. 50MB, 1GB). Default 0.
+--icloud-delete    Also offer to delete the trashed videos from iCloud.
+--icloud-dry-run   Show what would be deleted from iCloud; delete nothing.
+--max-delete N     Cap iCloud deletions for this run (default 500).
 --port N           Review server port (0 = auto).
 --no-browser       Print the review URL instead of opening a browser.
 ```
 
 Like `local-clean`, the first trash triggers the one-time macOS prompt to let
 your terminal control Finder — approve it under Privacy & Security → Automation.
+
+---
+
+## Deleting from iCloud too (`--icloud-delete`)
+
+`local-clean` and `video-clean` only move files to the macOS Trash. The photos
+themselves stay in iCloud — so the space is never actually reclaimed upstream,
+and **the next `sync` downloads them all again**. Passing `--icloud-delete` adds
+an opt-in step that moves the matching iCloud assets to *Recently Deleted*.
+
+```bash
+icloud-photo-sync video-clean --icloud-delete
+```
+
+What happens, in order:
+
+1. **Before the scan**, the terminal checks your iCloud session. If it has
+   expired you find out immediately — not after an hour of reviewing.
+2. The review page shows a red **iCloud deletion armed** banner and an
+   **Also delete from iCloud** checkbox (on by default). Unticking it for a
+   round trashes those files locally only. The page can only ever *narrow* the
+   decision — it cannot enable something the terminal did not authorise.
+3. **When the review ends**, the terminal lists exactly what matched, writes a
+   manifest, and asks you to type the number of assets back before anything is
+   deleted. Files it cannot match are named, with the reason, and left in iCloud.
+4. Each batch is deleted and then **independently re-checked**. If a deletion
+   cannot be confirmed the run stops immediately (exit code `5`) rather than
+   repeating an operation whose effect it cannot read.
+
+### What it refuses to delete
+
+A trashed file is only eligible when **exactly one** asset in the sync manifest
+claims its path, that download completed, the recorded size matches the file as
+it was the moment before trashing, and the file really is gone from disk. It
+never matches on filename — thousands of assets in a real library share one.
+Anything else is listed and skipped, because a file left in iCloud costs one
+re-download, and a wrongly deleted one costs a photo.
+
+Immediately before deleting, the live iCloud records are re-read and the
+filename, original size and capture date must still agree. Shared-library assets
+are always refused.
+
+### Getting them back
+
+Deletion sets iCloud's "Recently Deleted" state — **recoverable for about 30
+days** on any device signed into that Apple ID (Photos → Albums → Recently
+Deleted → Recover). The tool never touches the permanent-deletion flag. Your
+local copies also remain in the macOS Trash until you empty it (Finder → Trash →
+Put Back). Every run writes a manifest and an append-only receipt under
+`~/Library/Application Support/icloud-photo-sync/deletions/`, and
+`icloud-delete --explain <receipt>` re-reads iCloud to tell you the current
+state of everything in it.
+
+### If something goes wrong mid-run
+
+The manifest is written *before* anything is deleted, so an expired session, a
+dropped connection or a Ctrl-C never loses the work:
+
+```bash
+icloud-photo-sync icloud-delete --last       # retry; already-deleted items are skipped
+icloud-photo-sync icloud-delete --last --dry-run
+```
+
+Without `--icloud-delete`, nothing changes: no Apple ID is resolved, no Keychain
+is read, and neither clean command touches the network.
+
+### Already trashed things without the flag? (`--scan-trashed`)
+
+If you cleaned up *before* using `--icloud-delete`, no manifest exists and there
+is nothing for `--last` to resume. `--scan-trashed` reconstructs that session
+instead: it reconciles the folder against the sync manifest and offers the
+tracked files that are no longer on disk.
+
+```bash
+icloud-photo-sync icloud-delete --scan-trashed --dry-run   # always start here
+icloud-photo-sync icloud-delete --scan-trashed
+```
+
+**This evidence is weaker, and the tool says so.** The normal check compares the
+manifest's size against the file's size measured the instant before it was
+trashed. A file that is already gone cannot be measured, and comparing the
+manifest with itself proves nothing — so that check is not weakened here, it is
+*replaced*, and the plan is labelled `retrospective` everywhere it appears.
+
+What stands in for it:
+
+* **A verified-complete moment.** `sync` only skips a file without rewriting its
+  row when it confirms the file present at its expected size, so a finished full
+  pass over a manifest with no pending and no failed rows is a point at which
+  every tracked file was provably on disk. That timestamp bounds the window.
+* **The scan envelope.** A file no clean command would even list (a `.HEIC`, or a
+  JPEG above `--max-size`) cannot be explained by a clean session.
+* **The log.** Every browser trash round is logged, so the run can tell whether
+  a trash round actually happened in that window — and whether the logs reach
+  back far enough to be sure nothing happened unseen.
+* **The classification cache.** `local-clean` deletes a file's cache row when it
+  trashes it, so a missing file whose row survived was not trashed by it.
+* **Your eyes.** iCloud keeps a thumbnail of every asset, so the candidates are
+  shown in the usual review page even though the local files are gone. Only what
+  you tick is deleted. `--no-review` skips this.
+
+The whole run refuses — deleting nothing, writing no manifest — if the folder is
+not readable, if the manifest never completed a full pass, if the logs do not
+cover the window, if no trash round is logged in it, or **if any missing file
+falls outside every scan envelope**. That last one is strict on purpose: one
+hand-deleted file means something other than a clean session removed things, and
+the premise, not the file, is what is wrong. Read what it names and fix that.
+
+Deletions run in separately confirmed batches of `--max-delete` (500), each
+asking you to type `delete <n> retrospective` — the count alone will not do, so
+a confirmation cannot be recalled from an ordinary run. Files a concurrent
+`sync` restores drop out of later batches automatically.
+
+Two flags worth knowing: `--max-size` / `--min-size` declare the thresholds your
+past sessions used (they were never recorded, so today's defaults are assumed
+and printed), and `--corroborate-root DIR` points at another copy of the library
+so anything still present there at the same size is left alone.
 
 ---
 
@@ -268,6 +410,8 @@ your terminal control Finder — approve it under Privacy & Security → Automat
   `~/Library/Application Support/icloud-photo-sync/` — never mixed into your
   photos. The state DB is keyed by `(Apple ID, output folder)`, so each output
   folder keeps its own manifest.
+* **Deletion manifests and receipts:** `…/icloud-photo-sync/deletions/` — one
+  JSON plan and one JSONL receipt per run that offered to delete from iCloud.
 
 ---
 

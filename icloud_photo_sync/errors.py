@@ -71,6 +71,36 @@ class OperationCancelled(ICloudSyncError):
     """The user asked to stop (SIGINT/SIGTERM)."""
 
 
+# --- Remote deletion (icloud-delete) -----------------------------------------
+
+
+class ManifestMissingError(ICloudSyncError):
+    """No sync manifest exists for this Apple ID + output folder.
+
+    Deletion reads the manifest to learn which iCloud asset a local file came
+    from, so an absent manifest is never "nothing matched" — it means the
+    account or the folder is wrong, and saying so is the whole point.
+    """
+
+
+class ManifestMismatchError(ICloudSyncError):
+    """The manifest describes a different account or folder than the live session.
+
+    Deleting against the wrong library is the one mistake this tool must never
+    make, so any disagreement between the stamped identity, the resolved config
+    and the authenticated session stops the run.
+    """
+
+
+class UnverifiedDeletionError(ICloudSyncError):
+    """A delete could not be confirmed as applied.
+
+    Not "it failed" — *unknown*. Apple's API reported success but a follow-up
+    lookup did not show the asset deleted, which means our model of the API is
+    wrong; the run stops rather than repeating an unknown effect.
+    """
+
+
 # --- Local classification (local-clean) --------------------------------------
 
 

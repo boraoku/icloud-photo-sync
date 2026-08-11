@@ -230,10 +230,11 @@ class _Handler(_BaseHandler):
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length) or b"{}")
             ids = [int(i) for i in body.get("ids", [])]
+            icloud = bool(body.get("icloud", False))
         except (ValueError, TypeError):
             self._json(400, {"error": "bad request"})
             return
-        outcome = srv.do_trash(ids)
+        outcome = srv.do_trash(ids, icloud=icloud)
         self._json(200, {
             "moved": outcome.moved,
             "failed": [{"rel": r, "error": e} for r, e in outcome.failed],
@@ -260,12 +261,13 @@ class VideoReviewServer(TrashSession):
         host: str = "127.0.0.1",
         port: int = 0,
         posters: PosterCache | None = None,
+        icloud_armed: bool = False,
     ) -> None:
-        super().__init__(_Handler, trash_fn, token, host, port)
+        super().__init__(_Handler, trash_fn, token, host, port, icloud_armed)
         self.items = list(items)
         self._by_index = {it.index: it for it in self.items}
         self.posters = posters
-        self.page = render_video_page(token, self.items)
+        self.page = render_video_page(token, self.items, icloud_armed)
 
     def item_for(self, index: int) -> VideoItem | None:
         return self._by_index.get(index)
@@ -305,10 +307,14 @@ def _item_payload(it: VideoItem) -> dict:
     }
 
 
-def render_video_page(token: str, items: list[VideoItem]) -> str:
+def render_video_page(
+    token: str, items: list[VideoItem], icloud_armed: bool = False
+) -> str:
     """Return the review page with the token and item list embedded."""
     payload = json.dumps([_item_payload(it) for it in items])
-    return _TEMPLATE.replace("__TOKEN__", token).replace("__ITEMS_JSON__", payload)
+    return (_TEMPLATE.replace("__TOKEN__", token)
+            .replace("__ITEMS_JSON__", payload)
+            .replace("__ICLOUD__", "true" if icloud_armed else "false"))
 
 
 _TEMPLATE = """<!doctype html>
@@ -341,6 +347,13 @@ _TEMPLATE = """<!doctype html>
     background: #d13438; border-color: #b02a2e; color: #fff; font-weight: 600;
   }
   button.danger:hover:not(:disabled) { background: #b02a2e; }
+  .icloud {
+    font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px;
+    background: rgba(209,52,56,.14); color: #d13438; border: 1px solid rgba(209,52,56,.4);
+  }
+  .icloud-pick { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .icloud-pick input { accent-color: #d13438; }
+  [hidden] { display: none !important; }
   .grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
     gap: 12px; padding: 16px;
@@ -408,7 +421,11 @@ _TEMPLATE = """<!doctype html>
   <span class="count" id="count">Loading…</span>
   <span class="prog" id="progress"></span>
   <span id="status"></span>
+  <span class="icloud" id="icloudBanner" hidden>iCloud deletion armed</span>
   <span class="spacer"></span>
+  <label class="icloud-pick" id="icloudPick" hidden>
+    <input type="checkbox" id="icloudBox" checked> Also delete from iCloud
+  </label>
   <button id="all">Select all</button>
   <button id="none">Deselect all</button>
   <button id="finish">Finish</button>
@@ -426,6 +443,7 @@ _TEMPLATE = """<!doctype html>
 </div>
 <script>
 const TOKEN = "__TOKEN__";
+const ICLOUD_ARMED = __ICLOUD__;   // authorised in the terminal, not here
 const ITEMS = __ITEMS_JSON__;
 const cards = new Map();        // index -> card element
 const relToIndex = new Map();   // rel -> index
@@ -555,9 +573,20 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modal.hidden) closeModal();
 });
 
+function wantsICloud() {
+  const box = document.getElementById("icloudBox");
+  return ICLOUD_ARMED && !!box && box.checked;
+}
+
 async function doTrash() {
   if (!selected.size) return;
-  if (!confirm("Move " + selected.size + " file(s) to the Trash?")) return;
+  const alsoICloud = wantsICloud();
+  const question = alsoICloud
+    ? "Move " + selected.size + " file(s) to the Trash AND queue them for deletion "
+      + "from iCloud?\\n\\nYou will confirm the iCloud part in the terminal before "
+      + "anything is deleted there."
+    : "Move " + selected.size + " file(s) to the Trash?";
+  if (!confirm(question)) return;
   const btn = document.getElementById("trash");
   btn.disabled = true; btn.textContent = "Moving…";
   const ids = [...selected];
@@ -565,7 +594,7 @@ async function doTrash() {
     const resp = await fetch("/trash", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Clean-Token": TOKEN },
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify({ ids, icloud: alsoICloud }),
     });
     const data = await resp.json();
     for (const rel of (data.moved || [])) {
@@ -630,6 +659,12 @@ function showDone(data) {
     }
     div.appendChild(ul);
   }
+  if (data.icloud_armed && data.icloud) {
+    const p1 = document.createElement("p");
+    p1.textContent = data.icloud + " file(s) are queued for deletion from iCloud — "
+      + "go back to the terminal to confirm. Nothing has been deleted from iCloud yet.";
+    div.appendChild(p1);
+  }
   const p2 = document.createElement("p");
   p2.textContent = "You can close this tab. The command has finished.";
   div.appendChild(p2);
@@ -670,6 +705,11 @@ document.getElementById("trash").onclick = doTrash;
 document.getElementById("finish").onclick = () => {
   if (confirm("Finish the review session and exit the command?")) finishSession();
 };
+
+if (ICLOUD_ARMED) {
+  document.getElementById("icloudBanner").hidden = false;
+  document.getElementById("icloudPick").hidden = false;
+}
 
 for (const it of ITEMS) addCard(it);
 updateCounts();

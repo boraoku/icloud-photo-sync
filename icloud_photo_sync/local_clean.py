@@ -23,9 +23,10 @@ from pathlib import Path
 import typer
 from tqdm import tqdm
 
+from . import clean_icloud
 from .classifier import Classification, LMStudioClassifier, prepare_image
 from .clean_cache import CleanCache
-from .config import LocalCleanConfig
+from .config import IMAGE_SUFFIXES, LocalCleanConfig
 from .errors import ClassificationError, ClassifierUnavailableError
 from .logutil import get_logger
 from .review import FlaggedItem, ReviewServer
@@ -33,7 +34,6 @@ from .trash import move_to_trash
 
 logger = get_logger(__name__)
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 SECONDS_PER_IMAGE = 15  # rough LM Studio latency, for the ETA hint
 CONSECUTIVE_ERROR_LIMIT = 5  # abort a run if the model dies mid-stream
 ZERO_FLAGGED_GRACE = 3.0  # let the open tab's final poll render "Nothing flagged"
@@ -121,8 +121,15 @@ def _fmt_eta(n: int) -> str:
     return f"~{mins / 60:.1f} h"
 
 
-def run_local_clean(config: LocalCleanConfig) -> int:
-    """Execute the scan → stream-classify → review → trash flow. Returns exit code."""
+def run_local_clean(config: LocalCleanConfig, icloud=None) -> int:
+    """Execute the scan → stream-classify → review → trash flow. Returns exit code.
+
+    ``icloud`` is an optional :class:`~icloud_photo_sync.config.ICloudDeleteConfig`.
+    When given, the iCloud session is checked *before the scan* so a login problem
+    costs seconds instead of a whole review session; when None, nothing here
+    touches an Apple ID at all.
+    """
+    armed = clean_icloud.arm(icloud) if icloud is not None else None
     root = config.output_root
     typer.secho(f"Scanning {root} for images ≤ "
                 f"{config.max_bytes // 1024} KiB…", fg=typer.colors.BLUE)
@@ -144,6 +151,7 @@ def run_local_clean(config: LocalCleanConfig) -> int:
         server = ReviewServer(
             thumbs_dir=work_dir, trash_fn=move_to_trash,
             token=secrets.token_urlsafe(16), port=config.port,
+            icloud_armed=armed is not None,
         )
         server.start()
         url = server.url
@@ -169,7 +177,7 @@ def run_local_clean(config: LocalCleanConfig) -> int:
         server.mark_done()
         if results is not None:
             _print_category_summary(results, config)
-        return _finish_session(server, cache, interrupted)
+        return _finish_session(server, cache, interrupted, armed)
 
 
 def _split_cached(
@@ -293,7 +301,8 @@ def _print_category_summary(results, config) -> None:
     typer.echo(f"Flagged for deletion: {', '.join(config.flag_categories)}")
 
 
-def _finish_session(server: ReviewServer, cache: CleanCache, interrupted: bool) -> int:
+def _finish_session(server: ReviewServer, cache: CleanCache, interrupted: bool,
+                    armed=None) -> int:
     """Wait for the user to finish (or Ctrl-C), then report and clean up."""
     # Zero flagged and classification completed: nothing to review.
     if not interrupted and server.item_count == 0:
@@ -333,6 +342,15 @@ def _finish_session(server: ReviewServer, cache: CleanCache, interrupted: bool) 
     if interrupted and not outcome.moved and not outcome.failed:
         typer.secho("Progress is cached; re-run local-clean to resume.",
                     fg=typer.colors.YELLOW)
+    if armed is None and outcome.moved:
+        # These files are still in iCloud, so the next sync downloads every one
+        # of them again — say so here rather than let it look like a bug later.
+        typer.secho("They are still in iCloud, so the next sync will download "
+                    "them again. To delete them there too:\n"
+                    "  icloud-photo-sync icloud-delete --scan-trashed --dry-run",
+                    fg=typer.colors.YELLOW)
+    icloud_code = clean_icloud.finish_and_report(armed, outcome,
+                                                source="local-clean", progress=tqdm)
     if outcome.failed:
         return 1
-    return 130 if interrupted else 0
+    return icloud_code or (130 if interrupted else 0)

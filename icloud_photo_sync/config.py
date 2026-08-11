@@ -17,6 +17,12 @@ from pathlib import Path
 import keyring
 from keyring.errors import KeyringError, PasswordDeleteError
 
+from .icloud_delete import (
+    DEFAULT_BATCH_SIZE as DEFAULT_DELETE_BATCH,
+    DEFAULT_MAX_DELETE,
+    MAX_DELETE_CEILING,
+)
+
 APP_NAME = "icloud-photo-sync"
 KEYRING_SERVICE = "icloud-photo-sync"
 ENV_USERNAME = "ICLOUD_SYNC_USERNAME"
@@ -48,6 +54,17 @@ DEFAULT_THUMB_MAX_DIM = 1024                    # px; downscale for both LM and 
 
 # video-clean: hidden cache dir inside the photo tree (dot-dir: the scan prunes it).
 POSTER_CACHE_DIRNAME = ".icloud-photo-sync"
+
+# The scan envelopes: which files each clean command will even look at. They live
+# here rather than in the clean modules because ``retro_clean`` reasons about
+# them too — "no clean command could have offered this file" is only answerable
+# if the envelope is one shared definition. Re-exported from local_clean and
+# video_clean, which is where you would look for them first.
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+VIDEO_SUFFIXES = {
+    ".mov", ".mp4", ".m4v", ".avi", ".mpg", ".mpeg", ".3gp", ".3g2",
+    ".wmv", ".webm", ".mkv", ".mts", ".m2ts",
+}
 
 
 def default_config_root() -> Path:
@@ -259,6 +276,63 @@ class VideoCleanConfig:
                 raise TypeError(f"unknown config override: {k!r}")
             if v is not None:
                 setattr(cfg, k, v)
+        return cfg
+
+
+@dataclass
+class ICloudDeleteConfig:
+    """Opt-in "also delete from iCloud" side-car for the clean commands.
+
+    Deliberately *not* a field of :class:`LocalCleanConfig` /
+    :class:`VideoCleanConfig`: those keep their "no iCloud login" contract, and
+    this is the only object in either flow that knows an Apple ID exists. It
+    wraps :class:`AppConfig` verbatim so the manifest it reads is guaranteed to
+    be the very same file ``sync`` writes — same ``(apple_id, output_root)``
+    derivation, no second opinion about which library a folder belongs to.
+    """
+
+    app: AppConfig
+    manifest_dir: Path
+    state_key: str
+    cache_db: Path
+    """local-clean's classification cache — read-only evidence for retro_clean.
+
+    Derived exactly as :class:`LocalCleanConfig` derives it, so both names point
+    at one file. Never created from here; an absent cache simply contributes no
+    evidence.
+    """
+    dry_run: bool = False
+    max_delete: int = DEFAULT_MAX_DELETE
+    batch_size: int = DEFAULT_DELETE_BATCH
+
+    @classmethod
+    def create(
+        cls,
+        apple_id: str,
+        output_root: Path,
+        *,
+        config_root: Path | None = None,
+        **overrides,
+    ) -> "ICloudDeleteConfig":
+        app = AppConfig.create(apple_id, output_root, config_root=config_root)
+        manifest_dir = app.config_root / "deletions"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        cfg = cls(
+            app=app,
+            manifest_dir=manifest_dir,
+            state_key=_state_key(app.apple_id, app.output_root),
+            cache_db=(app.config_root / "state"
+                      / f"local-clean-{_clean_cache_key(app.output_root)}.db"),
+        )
+        for k, v in overrides.items():
+            if not hasattr(cfg, k):
+                raise TypeError(f"unknown config override: {k!r}")
+            if v is not None:
+                setattr(cfg, k, v)
+        if cfg.max_delete > MAX_DELETE_CEILING:
+            raise ValueError(
+                f"--max-delete cannot exceed {MAX_DELETE_CEILING}; split the work instead."
+            )
         return cfg
 
 
