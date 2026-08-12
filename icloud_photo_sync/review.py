@@ -507,6 +507,10 @@ const RETRO = __RETRO__;           // files already gone; iCloud is the only eff
 const cards = new Map();        // index -> card element
 const relToIndex = new Map();   // rel -> index
 const selected = new Set();     // selected indices (checked = will be trashed)
+// `done` means the item stream is complete — no more cards will arrive.
+// `finished` means the *session* is over and /finish has been sent. Conflating
+// the two made finishSession() a no-op the moment streaming ended, so the
+// server never learned the review had finished and the terminal waited forever.
 let since = 0, done = false, finished = false, pollFails = 0;
 let lastClassified = 0, lastTotal = 0;
 let statusTimer = null;
@@ -601,7 +605,7 @@ async function poll() {
     if (added) buildChips();
     updateCounts();
     if (done) {
-      finished = true;
+      // Stop polling — but leave `finished` alone, or Finish stops working.
       if (cards.size === 0) showNothingFlagged();
       return;
     }

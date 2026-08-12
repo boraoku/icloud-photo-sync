@@ -29,6 +29,13 @@ relies on, established by reading the installed source:
   still indexing AND for a missing ``ckdatabasews`` webservice ("Webservice not
   available"), which is the Advanced-Data-Protection / web-access-off symptom —
   the two must be told apart by message.
+* **``api.photos`` is a property that re-runs the whole PCS (Protected Cloud
+  Storage) handshake on every single access**, above its own cache — so reading
+  it in a loop is not free, it is one-to-two POSTs to Apple's setup endpoint
+  each time. Do enough of them and Apple revokes the device's PCS consent
+  mid-run and refuses to re-grant it ("Unable to request PCS access!"). Every
+  access in this module therefore goes through :meth:`ICloudClient._photos_raw`,
+  which resolves it once per session.
 
 This module is also the **only** one that mutates anything in iCloud (see
 :meth:`ICloudClient.delete_assets`). Two more verified 2.6.5 facts govern that:
@@ -428,6 +435,8 @@ class ICloudClient:
         self._service = service
         self._config = config
         self._cancel = cancel_event or Event()
+        # Resolved lazily and reused — see _photos_raw. Never touch directly.
+        self._photos_service = None
 
     def set_cancel_event(self, event: Event) -> None:
         self._cancel = event
@@ -449,10 +458,11 @@ class ICloudClient:
         deadline = time.monotonic() + self._config.indexing_max_wait
         while True:
             try:
-                album = self._service.photos.all
+                album = self._photos_raw().all
                 len(album)  # trigger activation / surface errors
                 return album
             except PyiCloudException as exc:
+                self._forget_photos()
                 mapped = map_api_error(exc)
                 if not isinstance(mapped, LibraryIndexingError):
                     raise mapped from exc
@@ -495,7 +505,7 @@ class ICloudClient:
         """
         self._all_album()  # surface indexing/precondition errors first
         try:
-            photos = self._service.photos
+            photos = self._photos_raw()
             library = getattr(photos, "_root_library", None)
             if library is None:
                 logger.warning("pyicloud exposes no _root_library; added-date listing unavailable.")
@@ -682,17 +692,52 @@ class ICloudClient:
         client = getattr(self._photos(), "_private_client", None)
         return all(callable(getattr(client, name, None)) for name in ("lookup", "modify"))
 
-    def _photos(self):
-        """``service.photos``, with pyicloud's errors translated to ours.
+    def _photos_raw(self):
+        """``service.photos``, resolved **once** and reused.
 
-        Reaching this attribute can trigger a PCS (Protected Cloud Storage)
-        request, so it fails for session reasons far more often than for
-        engine-capability reasons — the caller's exit code depends on telling
-        those apart.
+        This cache is not an optimisation, it is a correctness fix. pyicloud's
+        ``photos`` property runs a full PCS (Protected Cloud Storage) handshake
+        on *every* attribute access, above its own cache::
+
+            @property
+            def photos(self):
+                self._request_pcs_for_service("photos")   # every time
+                if not self._photos:                       # cache is below it
+
+        Each handshake is at least two POSTs to Apple's setup endpoint. Touching
+        the property once per batch meant ~24 handshakes for a thumbnail fetch
+        and ~360 for a full delete run; partway through, Apple revokes the
+        device's PCS consent and refuses to re-grant it ("Unable to request PCS
+        access!"). Resolving it once makes that one handshake per session.
+
+        Raises pyicloud's own exceptions, so callers that need to inspect them
+        (the indexing-wait loop) still can. See :meth:`_photos` for the mapped
+        flavour, and :meth:`_forget_photos` for invalidation.
+        """
+        if self._photos_service is None:
+            self._photos_service = self._service.photos
+        return self._photos_service
+
+    def _forget_photos(self) -> None:
+        """Drop the cached handle so the next call re-authenticates.
+
+        Called whenever a request fails: the cheap handshake is worth repeating
+        when something has actually gone wrong, and a session that expired
+        mid-run must not be papered over by a stale handle.
+        """
+        self._photos_service = None
+
+    def _photos(self):
+        """:meth:`_photos_raw` with pyicloud's errors translated to ours.
+
+        Reaching the underlying attribute fails for session reasons far more
+        often than for engine-capability reasons — the caller's exit code
+        depends on telling those apart.
         """
         try:
-            return self._service.photos
+            return self._photos_raw()
         except PyiCloudException as exc:
+            self._forget_photos()
             raise map_api_error(exc) from exc
 
     def _private_client(self):
@@ -773,6 +818,7 @@ class ICloudClient:
                 record_names=list(record_names), zone_id=zone_req, desired_keys=keys
             )
         except PyiCloudException as exc:
+            self._forget_photos()
             raise map_api_error(exc) from exc
         records: dict[str, CKRecord] = {}
         missing: list[str] = []
@@ -823,6 +869,7 @@ class ICloudClient:
         try:
             resp = client.modify(operations=operations, zone_id=zone_req, atomic=False)
         except PyiCloudException as exc:
+            self._forget_photos()
             raise map_api_error(exc) from exc
 
         outcomes: dict[str, DeleteResult] = {}

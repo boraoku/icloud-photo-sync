@@ -309,3 +309,91 @@ def test_package_never_calls_pyicloud_delete_or_album_get():
                     and target.value.attr == "all":
                 offenders.append(f"{source.name}:{node.lineno} .all.get()")
     assert offenders == []
+
+
+# --- the PCS handshake is resolved once, not once per request -----------------
+#
+# pyicloud's `photos` property re-runs the whole PCS handshake on EVERY attribute
+# access, above its own cache. Reading it per batch meant ~24 handshakes for a
+# thumbnail fetch and ~360 for a full delete run — enough that Apple revoked the
+# device's PCS consent partway through and the run died with "Unable to request
+# PCS access!". These tests are the fence around that.
+
+
+class CountingService:
+    """Counts reads of `.photos`, exactly as pyicloud counts PCS handshakes."""
+
+    def __init__(self, cloudkit):
+        self._photos = FakePhotos(cloudkit)
+        self.reads = 0
+
+    @property
+    def photos(self):
+        self.reads += 1
+        return self._photos
+
+
+def counting_client(tmp_path, cloudkit):
+    cfg = AppConfig.create("t@e.com", tmp_path / "out", config_root=tmp_path / "cfg")
+    service = CountingService(cloudkit)
+    return service, ICloudClient(service, cfg)
+
+
+def test_a_lookup_costs_one_pcs_handshake_not_two(tmp_path):
+    """_private_client() and _zone() each used to reach the property."""
+    service, client = counting_client(
+        tmp_path, FakeCloudKit(records=[asset_record(), master_record()]))
+
+    client.lookup_assets(["A1"])
+
+    assert service.reads == 1
+
+
+def test_many_lookups_share_one_handshake(tmp_path):
+    """The headline case: 12 chunks of thumbnails, or 20 delete batches."""
+    service, client = counting_client(
+        tmp_path, FakeCloudKit(records=[asset_record(), master_record()]))
+
+    for _ in range(12):
+        client.lookup_assets(["A1"])
+
+    assert service.reads == 1          # was 24
+
+
+def test_a_whole_delete_batch_shares_one_handshake(tmp_path):
+    """execute() does lookup + delete + verify(=lookup) per batch."""
+    service, client = counting_client(
+        tmp_path, FakeCloudKit(records=[asset_record(), master_record()],
+                               modify_records=[asset_record(deleted=1)]))
+
+    found, _ = client.lookup_assets(["A1"])
+    client.delete_assets(list(found.values()))
+    client.verify_deleted(["A1"])
+
+    assert service.reads == 1          # was 6 per batch
+
+
+def test_a_failed_request_drops_the_cached_handle(tmp_path):
+    """A session that expires mid-run must not be papered over by a stale handle."""
+    from pyicloud.exceptions import PyiCloudAPIResponseException
+
+    class Failing(FakeCloudKit):
+        def lookup(self, **kwargs):
+            raise PyiCloudAPIResponseException("boom")
+
+    service, client = counting_client(tmp_path, Failing())
+
+    with pytest.raises(Exception):
+        client.lookup_assets(["A1"])
+    assert service.reads == 1
+
+    with pytest.raises(Exception):
+        client.lookup_assets(["A1"])
+    assert service.reads == 2          # re-resolved rather than reused
+
+
+def test_supports_delete_does_not_burn_a_handshake_per_call(tmp_path):
+    service, client = counting_client(tmp_path, FakeCloudKit())
+    client.supports_delete()
+    client.supports_delete()
+    assert service.reads == 1

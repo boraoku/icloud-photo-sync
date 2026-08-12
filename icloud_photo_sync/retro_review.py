@@ -22,6 +22,7 @@ from __future__ import annotations
 import secrets
 import tempfile
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -35,6 +36,7 @@ from .trash import TrashResult
 logger = get_logger(__name__)
 
 THUMB_CHUNK = 100
+THUMB_WORKERS = 8      # latency-bound CDN GETs, not CPU work
 
 
 def _noop_trash(paths: Sequence[Path]) -> list[TrashResult]:
@@ -47,36 +49,81 @@ def _noop_trash(paths: Sequence[Path]) -> list[TrashResult]:
     return [TrashResult(path=p, ok=True) for p in paths]
 
 
+def thumbnail_urls(
+    client, candidates: Sequence[idel.Candidate],
+) -> dict[int, str]:
+    """Resolve every thumbnail URL first, in one tight run of lookups.
+
+    Deliberately separated from downloading. The lookups need iCloud's
+    authenticated session; the CDN fetches that follow do not. Interleaving them
+    used to stretch a handful of authenticated calls across a quarter of an hour
+    of slow transfers, which is exactly the shape that trips Apple's PCS
+    consent (see ``ICloudClient._photos_raw``). Done this way they finish in
+    seconds.
+
+    A chunk that fails is logged and skipped: its candidates simply show without
+    a picture. Losing the whole review — and with it the scan it took minutes to
+    build — over a decorative fetch would be the worse trade.
+    """
+    urls: dict[int, str] = {}
+    for start in range(0, len(candidates), THUMB_CHUNK):
+        batch = candidates[start:start + THUMB_CHUNK]
+        try:
+            found, _missing = client.lookup_assets([c.asset_id for c in batch])
+        except Exception as exc:  # noqa: BLE001 - cosmetic step, never fatal
+            logger.warning("could not look up thumbnails for %d asset(s): %s",
+                           len(batch), exc)
+            continue
+        for offset, candidate in enumerate(batch):
+            remote = found.get(candidate.asset_id)
+            url = getattr(remote, "thumb_url", None) if remote else None
+            if url:
+                urls[start + offset] = url
+    return urls
+
+
 def fetch_thumbnails(
     client,
     candidates: Sequence[idel.Candidate],
     thumbs_dir: Path,
     *,
     progress: Callable | None = None,
+    workers: int = THUMB_WORKERS,
 ) -> dict[str, Path]:
     """Write ``<index>.jpg`` for every candidate we can get a thumbnail for.
 
     A missing thumbnail is not an error: the card renders without an image and
     the user still sees the filename, size and date. Refusing to review because
     one CDN fetch failed would be a worse outcome than a blank tile.
+
+    Downloads run on a small pool. They are latency-bound signed-URL GETs, so
+    serialising them was costing about a second each — and the longer the whole
+    step takes, the more chances there are for the session underneath it to be
+    withdrawn.
     """
     thumbs_dir.mkdir(parents=True, exist_ok=True)
+    urls = thumbnail_urls(client, candidates)
     written: dict[str, Path] = {}
     bar = progress(total=len(candidates), desc="Fetching iCloud thumbnails",
                    unit="thumb") if progress else None
+
+    def fetch(item: tuple[int, str]) -> tuple[int, bytes | None]:
+        index, url = item
+        try:
+            return index, client.thumbnail_bytes(url)
+        except Exception as exc:  # noqa: BLE001 - one tile, never the run
+            logger.debug("thumbnail %d failed: %s", index, exc)
+            return index, None
+
     try:
-        for start in range(0, len(candidates), THUMB_CHUNK):
-            batch = candidates[start:start + THUMB_CHUNK]
-            found, _missing = client.lookup_assets([c.asset_id for c in batch])
-            for offset, candidate in enumerate(batch):
-                remote = found.get(candidate.asset_id)
-                url = getattr(remote, "thumb_url", None) if remote else None
-                if url:
-                    data = client.thumbnail_bytes(url)
-                    if data:
-                        path = thumbs_dir / f"{start + offset}.jpg"
-                        path.write_bytes(data)
-                        written[candidate.rel] = path
+        if bar:
+            bar.update(len(candidates) - len(urls))     # the ones with no URL
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for index, data in pool.map(fetch, urls.items()):
+                if data:
+                    path = thumbs_dir / f"{index}.jpg"
+                    path.write_bytes(data)
+                    written[candidates[index].rel] = path
                 if bar:
                     bar.update(1)
     finally:
@@ -103,7 +150,8 @@ def review_candidates(
 
     with tempfile.TemporaryDirectory(prefix="icloud-retro-review-") as tmp:
         thumbs_dir = Path(tmp)
-        fetch_thumbnails(client, candidates, thumbs_dir, progress=progress)
+        written = fetch_thumbnails(client, candidates, thumbs_dir, progress=progress)
+        missing = len(candidates) - len(written)
 
         server = ReviewServer(
             thumbs_dir=thumbs_dir,
@@ -135,14 +183,29 @@ def review_candidates(
                  "iCloud's own thumbnails.")
             echo("Select the ones you meant to delete; anything you leave "
                  "unselected stays in iCloud.")
+            if missing:
+                # Say it here rather than let blank tiles read as "iCloud has
+                # nothing for this" — the file may be perfectly fine.
+                echo(f"{missing} of {len(candidates)} thumbnails could not be "
+                     "fetched and show as blank tiles; that says nothing about "
+                     "the asset itself.", fg=typer.colors.YELLOW)
+            echo("Click Finish in the page when you are done — or press Ctrl-C "
+                 "here, which keeps whatever you have already selected.")
             if open_browser:
                 webbrowser.open(server.url)
             try:
                 server.wait_finished()
             except KeyboardInterrupt:
-                echo("\nReview interrupted — nothing was selected.",
+                # The selection is not lost work to be tidied away: the user made
+                # it deliberately and the server recorded it. Throwing it out on
+                # Ctrl-C silently undid a review that had already happened. The
+                # typed confirmation in the terminal is still the gate.
+                picked = frozenset(server.outcome.icloud)
+                echo(f"\nReview interrupted — keeping the {len(picked)} file(s) "
+                     "you had already selected." if picked else
+                     "\nReview interrupted — nothing had been selected.",
                      fg=typer.colors.YELLOW)
-                return frozenset()
+                return picked
             return frozenset(server.outcome.icloud)
         finally:
             server.close()
