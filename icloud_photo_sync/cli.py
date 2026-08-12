@@ -443,7 +443,8 @@ def icloud_delete_cmd(
         False, "--dry-run", help="Show what would be deleted, delete nothing."
     ),
     max_delete: Optional[int] = typer.Option(
-        None, "--max-delete", help="Cap deletions per confirmed batch (default 500)."
+        None, "--max-delete",
+        help="Refuse the run above N assets (default 500; --scan-trashed 2000)."
     ),
 ) -> None:
     """Finish (or retry) deleting already-trashed files from iCloud.

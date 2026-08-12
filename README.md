@@ -359,10 +359,17 @@ falls outside every scan envelope**. That last one is strict on purpose: one
 hand-deleted file means something other than a clean session removed things, and
 the premise, not the file, is what is wrong. Read what it names and fix that.
 
-Deletions run in separately confirmed batches of `--max-delete` (500), each
-asking you to type `delete <n> retrospective` — the count alone will not do, so
-a confirmation cannot be recalled from an ordinary run. Files a concurrent
-`sync` restores drop out of later batches automatically.
+The whole run is confirmed **once**, in two deliberate steps: type
+`delete <n> retrospective`, then `YES I AM SURE`. The count proves the number on
+screen was read and cannot be recalled from an ordinary run; the second phrase
+cannot be reached by pressing return. Files a concurrent `sync` has restored drop
+out before the count is quoted, so what you confirm is what goes.
+
+A retrospective run is bounded by a **2000-asset ceiling** rather than the
+measured path's 500-per-run cap — the CloudKit work is batched at 25 per request
+either way, so splitting the consent would have added a session resume per slice
+while teaching you to type the phrase without reading it. `--max-delete` lowers
+that ceiling if you want a smaller bite; above it the run refuses.
 
 Two flags worth knowing: `--max-size` / `--min-size` declare the thresholds your
 past sessions used (they were never recorded, so today's defaults are assumed

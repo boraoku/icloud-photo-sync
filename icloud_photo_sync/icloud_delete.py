@@ -173,6 +173,7 @@ class DeletionPlan:
 
     def retro_refusal(
         self, *, completed_rows: int, structural: Sequence[str],
+        max_delete: int | None = None,
     ) -> str | None:
         """Whole-run tripwires for a retrospective plan.
 
@@ -183,18 +184,21 @@ class DeletionPlan:
         shown. When the premise is broken the answer is to stop, because a
         carefully-filtered subset of a wrong premise is still wrong.
 
-        The per-run cap is deliberately *not* checked here. A retrospective run
-        is sliced into confirmed batches of ``max_delete`` instead, so a large
-        reconstruction costs proportionally more typed confirmations rather than
-        one raised flag. The proportion guard still applies to the whole plan,
-        because slicing must not be a way around it.
+        A retrospective run is confirmed once, for everything, so this ceiling is
+        what bounds it — not the measured path's per-run cap. ``max_delete``
+        lowers it when the user asks; unset, the hard ceiling applies. Splitting
+        the consent instead was worse on both counts: it added a session resume
+        per slice, and a prompt answered three times is a prompt that stops being
+        read.
         """
         if structural:
             return structural[0]
-        if len(self.candidates) > MAX_DELETE_CEILING:
-            return (f"{len(self.candidates)} assets exceeds the "
-                    f"{MAX_DELETE_CEILING} hard ceiling for a single run. Split the "
-                    "work by narrowing --max-size, or clean up in stages.")
+        ceiling = MAX_DELETE_CEILING if max_delete is None \
+            else min(MAX_DELETE_CEILING, max_delete)
+        if len(self.candidates) > ceiling:
+            return (f"{len(self.candidates)} assets exceeds the {ceiling}-asset "
+                    "ceiling for a single run. Narrow --max-size, raise "
+                    "--max-delete, or clean up in stages.")
         return self._fraction_refusal(completed_rows)
 
 

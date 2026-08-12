@@ -302,8 +302,22 @@ class ICloudDeleteConfig:
     evidence.
     """
     dry_run: bool = False
-    max_delete: int = DEFAULT_MAX_DELETE
+
+    max_delete: int | None = None
+    """``--max-delete``, or None when the user did not say.
+
+    None is meaningful, not a stand-in for the default: the measured path falls
+    back to :data:`DEFAULT_MAX_DELETE` per run, while a retrospective run bounds
+    itself by :data:`MAX_DELETE_CEILING` instead — it asks for one deliberate
+    confirmation covering everything rather than one per N assets.
+    """
+
     batch_size: int = DEFAULT_DELETE_BATCH
+
+    @property
+    def per_run_limit(self) -> int:
+        """The measured path's cap: what ``--max-delete`` means when unset."""
+        return DEFAULT_MAX_DELETE if self.max_delete is None else self.max_delete
 
     @classmethod
     def create(
@@ -329,7 +343,7 @@ class ICloudDeleteConfig:
                 raise TypeError(f"unknown config override: {k!r}")
             if v is not None:
                 setattr(cfg, k, v)
-        if cfg.max_delete > MAX_DELETE_CEILING:
+        if cfg.max_delete is not None and cfg.max_delete > MAX_DELETE_CEILING:
             raise ValueError(
                 f"--max-delete cannot exceed {MAX_DELETE_CEILING}; split the work instead."
             )

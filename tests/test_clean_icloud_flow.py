@@ -453,10 +453,21 @@ PASS_AT = "2026-07-27T08:20:10.339666+00:00"
 
 
 def seed_retro(tmp_path, rels_and_ids, *, size=100, trash_round=True,
-               log_start="2026-07-05 23:15:24", **cfg_kw):
-    """A folder whose manifest rows are all completed and all absent from disk."""
+               present=0, log_start="2026-07-05 23:15:24", **cfg_kw):
+    """A folder whose manifest rows are all completed and all absent from disk.
+
+    ``present`` adds rows whose files *do* exist, so a test can have a library
+    big enough for the 25%-of-the-manifest proportion guard to stay quiet.
+    """
     config = make_config(tmp_path, **cfg_kw)
     seed_manifest(config, rels_and_ids, size=size)
+    if present:
+        here = [(f"2019/01/KEEP_{n}.JPG", f"keep{n}") for n in range(present)]
+        seed_manifest(config, here, size=size)
+        for rel, _ in here:
+            path = config.app.output_root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * size)
     with StateStore(config.app.state_db) as state:
         state.set_meta("last_full_pass_at", PASS_AT)
         state.flush()
@@ -629,12 +640,17 @@ def test_retro_reports_a_whole_tree_and_deletes_nothing(tmp_path):
     assert any("Every tracked file is present" in ln for ln in lines)
 
 
-# --- slicing ------------------------------------------------------------------
+# --- one consent for the whole run ---------------------------------------------
+#
+# This used to ask once per 500 assets. The CloudKit modify is batched at 25
+# regardless, gate_remote re-checks every one of those batches, and each extra
+# slice cost another session resume — so splitting the consent made the run more
+# fragile while training the user to type the phrase without reading it.
 
 
-def test_a_large_plan_is_deleted_in_separately_confirmed_batches(tmp_path):
+def test_a_large_plan_is_confirmed_once_and_deleted_in_one_pass(tmp_path):
     pairs = [retro_pair(n) for n in range(7)]
-    config = seed_retro(tmp_path, pairs, max_delete=3)
+    config = seed_retro(tmp_path, pairs)
     client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
                                  for rel, aid in pairs})
     FakeSession.client = client
@@ -645,52 +661,94 @@ def test_a_large_plan_is_deleted_in_separately_confirmed_batches(tmp_path):
         confirm=lambda n: asked.append(n) or True, echo=lambda *a, **k: None)
 
     assert code == 0
-    assert asked == [3, 3, 1]                       # 7 assets, cap 3
+    assert asked == [7]                       # once, for everything
     assert len(client.deleted) == 7
     assert len(list(config.manifest_dir.glob("*.json"))) == 1
     assert len(list(config.manifest_dir.glob("*.receipt.jsonl"))) == 1
 
 
-def test_declining_a_later_batch_keeps_what_already_went(tmp_path):
+def test_declining_deletes_nothing_at_all(tmp_path):
+    pairs = [retro_pair(n) for n in range(5)]
+    config = seed_retro(tmp_path, pairs)
+    client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
+                                 for rel, aid in pairs})
+    FakeSession.client = client
+
+    code = clean_icloud.run_retro(
+        config, session_factory=FakeSession, no_review=True,
+        confirm=lambda n: False, echo=lambda *a, **k: None)
+
+    assert code == 0 and client.deleted == []
+
+
+def test_a_restored_file_drops_out_before_the_confirmation(tmp_path):
+    """A concurrent sync putting a file back is a retraction, and the number
+    quoted in the prompt has to already account for it."""
+    pairs = [retro_pair(n) for n in range(4)]
+    config = seed_retro(tmp_path, pairs)
+    client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
+                                 for rel, aid in pairs})
+    FakeSession.client = client
+    path = config.app.output_root / "2024/03/IMG_3.JPG"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * 100)
+    asked = []
+
+    code = clean_icloud.run_retro(
+        config, session_factory=FakeSession, no_review=True,
+        confirm=lambda n: asked.append(n) or True, echo=lambda *a, **k: None)
+
+    assert code == 0
+    assert asked == [3]                        # quoted 3, not 4
+    assert "a3" not in client.deleted and len(client.deleted) == 3
+
+
+def test_max_delete_refuses_a_run_rather_than_splitting_it(tmp_path):
     pairs = [retro_pair(n) for n in range(5)]
     config = seed_retro(tmp_path, pairs, max_delete=2)
     client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
                                  for rel, aid in pairs})
     FakeSession.client = client
-    answers = iter([True, False])
+    lines = []
 
-    code = clean_icloud.run_retro(
-        config, session_factory=FakeSession, no_review=True,
-        confirm=lambda n: next(answers), echo=lambda *a, **k: None)
+    code = clean_icloud.run_retro(config, session_factory=FakeSession,
+                                  no_review=True, confirm=lambda n: True,
+                                  echo=collect(lines))
 
-    assert code == 0 and len(client.deleted) == 2
+    assert code == 1 and client.deleted == []
+    assert any("exceeds the 2-asset ceiling" in ln for ln in lines)
 
 
-def test_a_file_restored_between_batches_drops_out(tmp_path):
-    """A concurrent sync putting a file back is a retraction, and the next batch
-    has to see it."""
-    pairs = [retro_pair(n) for n in range(4)]
-    config = seed_retro(tmp_path, pairs, max_delete=2)
+def test_an_unset_max_delete_allows_a_thousand_plus_in_one_go(tmp_path):
+    """The real case: 1,116 assets, one confirmation, no --max-delete needed."""
+    pairs = [retro_pair(n) for n in range(1116)]
+    config = seed_retro(tmp_path, pairs, present=3348)   # keep under the 25% guard
     client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
                                  for rel, aid in pairs})
     FakeSession.client = client
-    calls = []
-
-    def confirm(n):
-        calls.append(n)
-        if len(calls) == 1:                       # restore one before batch 2
-            path = config.app.output_root / "2024/03/IMG_3.JPG"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"x" * 100)
-        return True
+    asked = []
 
     code = clean_icloud.run_retro(
         config, session_factory=FakeSession, no_review=True,
-        confirm=confirm, echo=lambda *a, **k: None)
+        confirm=lambda n: asked.append(n) or True, echo=lambda *a, **k: None)
 
-    assert code == 0
-    assert "a3" not in client.deleted and len(client.deleted) == 3
+    assert code == 0 and asked == [1116] and len(client.deleted) == 1116
 
+
+def test_beyond_the_hard_ceiling_it_still_refuses(tmp_path):
+    pairs = [retro_pair(n) for n in range(2100)]
+    config = seed_retro(tmp_path, pairs)
+    client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
+                                 for rel, aid in pairs})
+    FakeSession.client = client
+    lines = []
+
+    code = clean_icloud.run_retro(config, session_factory=FakeSession,
+                                  no_review=True, confirm=lambda n: True,
+                                  echo=collect(lines))
+
+    assert code == 1 and client.deleted == []
+    assert any("2000-asset ceiling" in ln for ln in lines)
 
 # --- resuming a retrospective manifest ----------------------------------------
 
@@ -763,15 +821,55 @@ def test_a_retro_manifest_refuses_if_the_reconstruction_no_longer_holds(tmp_path
 # --- the confirmation phrase --------------------------------------------------
 
 
-def test_the_retrospective_confirmation_demands_the_evidence_class(monkeypatch):
-    """A bare count recalled from a measured run must not work here."""
+def _answers(*replies):
+    """A prompt stub that replies in order, and records what it was asked."""
+    seen, it = [], iter(replies)
+
+    def prompt(question, **kw):
+        seen.append(question)
+        return next(it)
+    prompt.asked = seen
+    return prompt
+
+
+def test_the_retrospective_confirmation_takes_two_deliberate_steps(monkeypatch):
+    """The count proves the number was read; YES I AM SURE cannot be reached by
+    pressing return. One pair of questions covers the whole run."""
     monkeypatch.setattr(clean_icloud.sys.stdin, "isatty", lambda: True, raising=False)
 
-    assert not clean_icloud._confirm_retrospective(500, prompt=lambda *a, **k: "500")
+    ask = _answers("delete 1116 retrospective", "YES I AM SURE")
+    assert clean_icloud._confirm_retrospective(1116, prompt=ask)
+    assert "delete 1116 retrospective" in ask.asked[0]
+    assert "YES I AM SURE" in ask.asked[1]
+
+
+def test_the_count_alone_is_not_enough(monkeypatch):
+    monkeypatch.setattr(clean_icloud.sys.stdin, "isatty", lambda: True, raising=False)
+    ask = _answers("delete 1116 retrospective", "")
+    assert not clean_icloud._confirm_retrospective(1116, prompt=ask)
+
+
+def test_a_wrong_count_never_reaches_the_second_question(monkeypatch):
+    monkeypatch.setattr(clean_icloud.sys.stdin, "isatty", lambda: True, raising=False)
+    ask = _answers("delete 500 retrospective")          # only one reply available
+    assert not clean_icloud._confirm_retrospective(1116, prompt=ask)
+    assert len(ask.asked) == 1
+
+
+def test_confirmation_forgives_typing_but_not_intent(monkeypatch):
+    """Case and stray spaces carry no meaning; the words do."""
+    monkeypatch.setattr(clean_icloud.sys.stdin, "isatty", lambda: True, raising=False)
+
     assert clean_icloud._confirm_retrospective(
-        500, prompt=lambda *a, **k: "delete 500 retrospective")
+        7, prompt=_answers("  delete 7 RETROSPECTIVE ", "yes i am sure"))
     assert not clean_icloud._confirm_retrospective(
-        500, prompt=lambda *a, **k: "delete 499 retrospective")
+        7, prompt=_answers("delete 7 retrospective", "yes"))
+
+
+def test_a_non_interactive_run_is_refused(monkeypatch):
+    monkeypatch.setattr(clean_icloud.sys.stdin, "isatty", lambda: False, raising=False)
+    with pytest.raises(ICloudSyncError, match="interactive confirmation"):
+        clean_icloud._confirm_retrospective(7, prompt=_answers("x", "y"))
 
 
 def test_the_measured_confirmation_is_unchanged(monkeypatch):
@@ -797,11 +895,12 @@ def test_retro_clean_stays_credential_free():
     assert "auth" not in imported and "icloud_client" not in imported
 
 
-def test_resuming_a_retro_manifest_slices_instead_of_refusing_at_the_cap(tmp_path):
-    """Regression: --last used to hit guard_refusal and tell the user to "trash
-    fewer files at a time", which is impossible once the files are gone."""
+def test_resuming_a_retro_manifest_asks_once_for_everything(tmp_path):
+    """Regression: --last used to hit the measured path's 500-per-run cap and
+    tell the user to "trash fewer files at a time", which is impossible once the
+    files are gone. It now takes the same single consent as --scan-trashed."""
     pairs = [retro_pair(n) for n in range(5)]
-    config = seed_retro(tmp_path, pairs, max_delete=2)
+    config = seed_retro(tmp_path, pairs)
     client = FakeClient(remotes={aid: FakeRemote(aid, rel.split("/")[-1])
                                  for rel, aid in pairs})
     FakeSession.client = client
@@ -812,14 +911,13 @@ def test_resuming_a_retro_manifest_slices_instead_of_refusing_at_the_cap(tmp_pat
     [manifest] = list(config.manifest_dir.glob("*.json"))
     assert client.deleted == []
 
-    asked = []
-    lines = []
+    asked, lines = [], []
     code = clean_icloud.run_from_manifest(
         config, manifest, session_factory=FakeSession,
         confirm=lambda n: asked.append(n) or True, echo=collect(lines))
 
     assert code == 0
-    assert asked == [2, 2, 1]                      # sliced, not refused
+    assert asked == [5]
     assert len(client.deleted) == 5
     assert not any("trash fewer files" in ln for ln in lines)
 

@@ -168,7 +168,7 @@ def finish_and_report(
         return 0
 
     refusal = plan.guard_refusal(completed_rows=armed.tracked_assets,
-                                 max_delete=icloud.max_delete)
+                                 max_delete=icloud.per_run_limit)
     if refusal:
         echo(refusal, fg=typer.colors.RED, err=True)
         return 1
@@ -388,8 +388,32 @@ def _confirm_by_count(
     return str(answer).strip() == wanted
 
 
+SURE_PHRASE = "YES I AM SURE"
+
+
+def _normalise(answer: str) -> str:
+    """Compare intent, not typing: case and runs of spaces carry no meaning."""
+    return " ".join(str(answer).split()).casefold()
+
+
 def _confirm_retrospective(count: int, *, prompt: Callable[..., str] = typer.prompt) -> bool:
-    return _confirm_by_count(count, phrase="retrospective", prompt=prompt)
+    """Two questions, once, for the whole run.
+
+    The count proves the number on screen was read; ``YES I AM SURE`` is a
+    second, deliberate act that cannot be reached by pressing return. Asking
+    this once for a large plan is stronger than asking it repeatedly for slices
+    of one — a prompt you answer three times is a prompt you stop reading.
+    """
+    if not sys.stdin.isatty():
+        raise ICloudSyncError(
+            "Refusing to delete from iCloud without an interactive confirmation."
+        )
+    wanted = f"delete {count} retrospective"
+    if _normalise(prompt(f"Type  {wanted}  to continue",
+                         default="", show_default=False)) != _normalise(wanted):
+        return False
+    return _normalise(prompt(f"Now type  {SURE_PHRASE}  to delete them",
+                             default="", show_default=False)) == _normalise(SURE_PHRASE)
 
 
 def _utc_now() -> datetime:
@@ -470,10 +494,11 @@ def run_from_manifest(
     # the per-run cap — "trash fewer files at a time" is not advice anyone can
     # act on when the files are already gone.
     refusal = (plan.retro_refusal(completed_rows=armed.tracked_assets,
-                                  structural=scan_result.structural)
+                                  structural=scan_result.structural,
+                                  max_delete=icloud.max_delete)
                if retrospective else
                plan.guard_refusal(completed_rows=armed.tracked_assets,
-                                  max_delete=icloud.max_delete))
+                                  max_delete=icloud.per_run_limit))
     if refusal:
         echo(refusal, fg=typer.colors.RED, err=True)
         return 1
@@ -482,7 +507,7 @@ def run_from_manifest(
         return 0
 
     if retrospective:
-        return _apply_in_slices(
+        return _apply_retro(
             armed, plan, Path(manifest_path), source="icloud-delete",
             confirm=confirm or _confirm_retrospective,
             session_factory=session_factory, echo=echo,
@@ -588,7 +613,8 @@ def run_retro(
         return 0
 
     refusal = plan.retro_refusal(completed_rows=armed.tracked_assets,
-                                 structural=scan_result.structural)
+                                 structural=scan_result.structural,
+                                 max_delete=icloud.max_delete)
     if refusal:
         echo(refusal, fg=typer.colors.RED, err=True)
         return 1
@@ -597,10 +623,10 @@ def run_retro(
         echo("Next:  icloud-photo-sync icloud-delete --scan-trashed")
         return 0
 
-    return _apply_in_slices(armed, plan, manifest_path,
-                            confirm=confirm or _confirm_retrospective,
-                            session_factory=session_factory, echo=echo,
-                            progress=progress, cancel=cancel)
+    return _apply_retro(armed, plan, manifest_path,
+                        confirm=confirm or _confirm_retrospective,
+                        session_factory=session_factory, echo=echo,
+                        progress=progress, cancel=cancel)
 
 
 def _review_with_thumbnails(session_factory, echo, progress):
@@ -613,7 +639,7 @@ def _review_with_thumbnails(session_factory, echo, progress):
     return look
 
 
-def _apply_in_slices(
+def _apply_retro(
     armed: ArmedICloud,
     plan: idel.DeletionPlan,
     manifest_path: Path,
@@ -625,50 +651,45 @@ def _apply_in_slices(
     cancel,
     source: str = "retro-clean",
 ) -> int:
-    """Delete in confirmed slices of ``max_delete``.
+    """Confirm the whole plan once, then delete it in one pass.
 
-    The per-run cap exists so a large plan costs proportionally more deliberate
-    consent, not so it can be raised with a flag. Each slice re-plans against
-    the current tree, so files restored by a concurrent ``sync`` drop out, and
-    stopping between slices leaves everything already done recorded.
+    This used to ask once per 500 assets. That bought nothing: the CloudKit
+    modify is batched at :data:`~icloud_photo_sync.icloud_delete.DEFAULT_BATCH_SIZE`
+    (25) regardless, ``gate_remote`` re-checks the live record before every one
+    of those batches, and each extra slice meant another :meth:`resume` — so
+    splitting the consent made the run *more* network-fragile, not less, while
+    training the user to type the phrase without reading it. The size ceiling in
+    :meth:`DeletionPlan.retro_refusal` is what bounds a run now.
+
+    Files a concurrent ``sync`` has restored are dropped here, immediately
+    before the confirmation, so what is quoted is what will go.
     """
     icloud = armed.config
-    size = max(1, icloud.max_delete)
-    slices = [plan.candidates[i:i + size]
-              for i in range(0, len(plan.candidates), size)]
-    worst = 0
+    still = [c for c in plan.candidates
+             if not (icloud.app.output_root / c.rel).exists()]
+    restored = len(plan.candidates) - len(still)
+    if restored:
+        echo(f"\n{restored} file(s) are back on disk and were dropped.",
+             fg=typer.colors.YELLOW)
+    if not still:
+        echo("Nothing left to delete from iCloud.", fg=typer.colors.GREEN)
+        return 0
+    if cancel is not None and cancel.is_set():
+        echo("\nStopped before anything was deleted.", fg=typer.colors.YELLOW)
+        return 130
 
-    for number, batch in enumerate(slices, start=1):
-        if cancel is not None and cancel.is_set():
-            echo("\nStopped before the next batch.", fg=typer.colors.YELLOW)
-            return worst or 130
-        still = [c for c in batch if not (icloud.app.output_root / c.rel).exists()]
-        restored = len(batch) - len(still)
-        if restored:
-            echo(f"\n{restored} file(s) are back on disk and were dropped from "
-                 f"batch {number}.", fg=typer.colors.YELLOW)
-        if not still:
-            continue
+    echo(f"\nDeleting from iCloud removes these photos from EVERY device signed "
+         f"into {armed.who}.", fg=typer.colors.YELLOW)
+    echo(f"They stay recoverable in Recently Deleted for about {RECOVERY_DAYS} days.")
+    echo("Your LOCAL copies are already gone — for these files, Recently Deleted "
+         "is the only copy that will exist.", fg=typer.colors.YELLOW)
+    if not confirm(len(still)):
+        echo("Not confirmed — nothing was deleted from iCloud.", fg=typer.colors.YELLOW)
+        return 0
 
-        echo(f"\nDeleting from iCloud removes these photos from EVERY device signed "
-             f"into {armed.who}.", fg=typer.colors.YELLOW)
-        echo(f"They stay recoverable in Recently Deleted for about {RECOVERY_DAYS} days.")
-        echo("Your LOCAL copies are already gone — for these files, Recently Deleted "
-             "is the only copy that will exist.", fg=typer.colors.YELLOW)
-        if len(slices) > 1:
-            echo(f"\nBatch {number} of {len(slices)} — {len(still)} of "
-                 f"{len(plan.candidates)} assets.")
-        if not confirm(len(still)):
-            echo("Not confirmed — stopping here.", fg=typer.colors.YELLOW)
-            return worst
-
-        code = _apply(armed, idel.DeletionPlan(candidates=still), manifest_path,
-                      source=source, session_factory=session_factory,
-                      echo=echo, progress=progress, cancel=cancel)
-        worst = code or worst
-        if code in (2, 3, 5):
-            return code            # session or verification failure: stop entirely
-    return worst
+    return _apply(armed, idel.DeletionPlan(candidates=still), manifest_path,
+                  source=source, session_factory=session_factory,
+                  echo=echo, progress=progress, cancel=cancel)
 
 
 def explain_receipt(
