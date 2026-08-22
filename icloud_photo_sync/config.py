@@ -55,6 +55,26 @@ DEFAULT_THUMB_MAX_DIM = 1024                    # px; downscale for both LM and 
 # video-clean: hidden cache dir inside the photo tree (dot-dir: the scan prunes it).
 POSTER_CACHE_DIRNAME = ".icloud-photo-sync"
 
+# video-optimise. The rationale for each of these lives in
+# :mod:`icloud_photo_sync.video_optimise`, which owns the policy; these are only
+# the CLI-overridable defaults. The floor is the important one: on a real
+# 1,504-video library the 637 clips at or above 20 MiB held 90% of all video
+# bytes, and the 722 smaller ones would have added four hours of encoding for
+# 2.5 GiB.
+DEFAULT_OPTIMISE_MIN_BYTES = 20 * 1024 * 1024
+DEFAULT_OPTIMISE_SHORT_SIDE = 1080     # the SHORTER side, never a bounding box
+DEFAULT_OPTIMISE_MAX_FPS = 30.0        # never applied to slow motion
+DEFAULT_OPTIMISE_HDR_BITRATE = 8_000_000
+DEFAULT_OPTIMISE_SDR_BITRATE = 6_000_000
+DEFAULT_OPTIMISE_MIN_FREE = 5 * 1024 * 1024 * 1024   # headroom on the output volume
+
+# Where video-optimise leaves finished conversions for the user to upload. A
+# plain, visible folder at the top of the photo tree, deliberately NOT inside
+# the dot-directory the poster cache uses: Finder and the iOS Files app both
+# hide dot-folders, and this folder exists to be opened and dragged out of.
+# Every scanner excludes it by name (see local_clean.iter_media_files).
+OPTIMISED_DIRNAME = "optimised"
+
 # The scan envelopes: which files each clean command will even look at. They live
 # here rather than in the clean modules because ``retro_clean`` reasons about
 # them too — "no clean command could have offered this file" is only answerable
@@ -277,6 +297,130 @@ class VideoCleanConfig:
             if v is not None:
                 setattr(cfg, k, v)
         return cfg
+
+
+@dataclass
+class VideoOptimiseConfig:
+    """Configuration for ``video-optimise``: re-encode big videos, then swap them.
+
+    Like :class:`VideoCleanConfig` the *conversion* half needs no Apple ID — with
+    ``--no-upload`` the whole scan/convert/compare flow runs offline, and the
+    credential-free contract holds. Only the swap phase resolves an Apple ID, and
+    it does so through :class:`ICloudDeleteConfig` exactly as the clean commands
+    do, so there is never a second opinion about which library a folder is.
+
+    Two directories matter. Converted files land in ``work_dir``, a hidden folder
+    inside the photo tree: the scanners prune dot-directories so a half-finished
+    run can never be mistaken for library content, and unplugging the drive takes
+    the work in progress with it. The job database lives in the config root
+    instead, keyed by ``(apple_id, output_root)`` like every other durable file
+    here, because a resumable job must survive the tree being remounted.
+    """
+
+    output_root: Path
+    logs_dir: Path
+    work_dir: Path
+    job_db: Path
+    poster_cache_dir: Path
+
+    min_bytes: int = DEFAULT_OPTIMISE_MIN_BYTES
+    short_side: int = DEFAULT_OPTIMISE_SHORT_SIDE
+    max_fps: float = DEFAULT_OPTIMISE_MAX_FPS
+    hdr_bitrate: int = DEFAULT_OPTIMISE_HDR_BITRATE
+    sdr_bitrate: int = DEFAULT_OPTIMISE_SDR_BITRATE
+
+    skip_hdr: bool = False
+    hdr_only: bool = False
+    limit: int | None = None
+    """``--limit``: convert at most N videos this run, resuming the rest later."""
+
+    min_free_bytes: int = DEFAULT_OPTIMISE_MIN_FREE
+    dry_run: bool = False
+    offline: bool = False
+    """Convert only: resolve no Apple ID, read no Keychain, touch no network.
+
+    Renamed from ``--no-upload``, which stopped describing anything once Apple
+    closed the upload endpoint — nothing uploads on any path now. What the flag
+    still controls is real, though: whether this command has an iCloud identity
+    at all, which is the credential-free contract ``local-clean`` and
+    ``video-clean`` also hold.
+    """
+    reconcile_only: bool = False
+    """Finish yesterday's uploads and stop: reconcile, delete, clean up."""
+    restart: bool = False
+
+    port: int = 0
+    open_browser: bool = True
+    verbose: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        output_root: Path,
+        *,
+        apple_id: str | None = None,
+        config_root: Path | None = None,
+        **overrides,
+    ) -> "VideoOptimiseConfig":
+        output_root = Path(output_root).resolve()
+        config_root = (config_root or default_config_root()).resolve()
+        logs_dir = config_root / "logs"
+        state_dir = config_root / "state"
+        for d in (config_root, logs_dir, state_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Keyed by the folder alone when no Apple ID is in play (--no-upload), so
+        # an offline run and a later online one on the same tree share one job.
+        key = (_state_key(apple_id, output_root) if apple_id
+               else _clean_cache_key(output_root))
+
+        # Visible, flat, at the top of the tree: the user has to be able to find
+        # this folder and drag its contents into iCloud, which a dot-directory
+        # and a nested YYYY/MM structure both make needlessly hard. A read-only
+        # or full volume falls back to the config root rather than failing.
+        work_dir = output_root / OPTIMISED_DIRNAME
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            work_dir = config_root / "cache" / f"optimised-{_clean_cache_key(output_root)}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+        poster_cache_dir = output_root / POSTER_CACHE_DIRNAME / "posters"
+        try:
+            poster_cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            poster_cache_dir = (config_root / "cache"
+                                / f"video-posters-{_clean_cache_key(output_root)}")
+            poster_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg = cls(
+            output_root=output_root, logs_dir=logs_dir, work_dir=work_dir,
+            job_db=state_dir / f"video-optimise-{key}.db",
+            poster_cache_dir=poster_cache_dir,
+        )
+        for k, v in overrides.items():
+            if not hasattr(cfg, k):
+                # Match AppConfig.create: a silently-dropped typo would run with
+                # defaults and be near-impossible to debug; fail loudly instead.
+                raise TypeError(f"unknown config override: {k!r}")
+            if v is not None:
+                setattr(cfg, k, v)
+        if cfg.skip_hdr and cfg.hdr_only:
+            raise ValueError("--skip-hdr and --hdr-only ask for opposite things.")
+        return cfg
+
+    @property
+    def legacy_work_dir(self) -> Path:
+        """Where conversions lived before the folder became visible and flat.
+
+        Kept so a job started under the old layout can be migrated rather than
+        re-encoded from scratch — the files are hours of work and perfectly good.
+        """
+        return self.output_root / POSTER_CACHE_DIRNAME / "optimised"
+
+    def work_path(self, name: str) -> Path:
+        """Absolute path of a flat conversion name inside :attr:`work_dir`."""
+        return self.work_dir / name
 
 
 @dataclass

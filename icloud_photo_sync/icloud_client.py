@@ -60,6 +60,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event
 from typing import Iterator, Sequence
 
@@ -806,6 +807,45 @@ class ICloudClient:
         if not data or len(data) > max_bytes:
             return None
         return data
+
+    # -- upload: not possible any more -----------------------------------------
+    #
+    # There is deliberately no upload method here. Apple has closed both routes
+    # to web-authenticated third-party clients, verified against a live account:
+    #
+    #   uploadimagews /upload   HTTP 410 "Gone" for every request shape (raw
+    #                           body under three content types, multipart), every
+    #                           media type, down to a 247-byte JPEG. The 413s a
+    #                           caller sees on larger files are a front proxy
+    #                           bouncing the body before the app server answers.
+    #   CloudKit assets/upload  A static policy refusal: QUOTA_EXCEEDED with a
+    #                           retryAfter that never decreases, on an account
+    #                           with 21.8 GiB of 200 GiB free. Payload variants
+    #                           and current icloud.com build numbers change
+    #                           nothing.
+    #
+    # The same session's records/lookup and records/modify keep working, which is
+    # what the deletion path runs on — so this is upload-specific, not an auth or
+    # session problem, and no amount of header-fiddling will fix it. pyicloud's
+    # own ``upload_file`` targets the same dead endpoint.
+    #
+    # ``video-optimise`` therefore hands the files to the user to upload through
+    # Apple's own clients and finds them again with
+    # :func:`icloud_photo_sync.optimise.reconcile`, which is what
+    # :meth:`verify_present` below exists to serve.
+
+    def verify_present(self, asset_id: str) -> RemoteAsset | None:
+        """Read the asset back. ``None`` unless it exists and is not deleted.
+
+        This is what turns "Apple accepted the POST" into "the replacement is in
+        the library", and no original may be deleted without it — the same rule
+        :meth:`verify_deleted` enforces from the other side.
+        """
+        found, _ = self.lookup_assets([asset_id])
+        asset = found.get(asset_id)
+        if asset is None or asset.is_deleted or asset.is_expunged:
+            return None
+        return asset
 
     def _lookup_records(
         self, client, zone_req: CKZoneIDReq, record_names: Sequence[str], keys: list[str]

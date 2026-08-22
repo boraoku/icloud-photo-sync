@@ -147,6 +147,10 @@ GLOBAL options:
 * **`video-clean`** — list downloaded videos largest-first, preview any of them
   in the browser, and move the ones you choose to the Trash to reclaim space. No
   iCloud login and no model required. See the section below.
+* **`video-optimise`** — re-encode oversized videos to 1080p HEVC, keeping the
+  capture date, location, HDR colour and (for slow motion) the frame rate; you
+  upload the results yourself, and it reconciles them back into your library.
+  See the section below.
 * **`icloud-delete`** — finish or retry deleting already-trashed files from
   iCloud, using the manifest a clean session wrote; or `--scan-trashed` to
   reconstruct a session that ran before the flag existed. See *Deleting from
@@ -251,6 +255,167 @@ How it works:
 
 Like `local-clean`, the first trash triggers the one-time macOS prompt to let
 your terminal control Finder — approve it under Privacy & Security → Automation.
+
+---
+
+## Shrink videos in iCloud (`video-optimise`)
+
+`video-clean` frees space by *removing* clips. `video-optimise` frees space by
+making them smaller and putting them back — so the video stays in your library,
+in the right place on the timeline, just at a sane bitrate.
+
+On the library this was built against, videos were **6% of the files and 61% of
+the bytes**. Re-encoding the big ones to 1080p HEVC gives back about **39 GB**
+and takes roughly six hours of (interruptible) encoding.
+
+**Apple has closed every programmatic way to upload into iCloud Photos.** This
+was checked against a live account: the legacy `uploadimagews` endpoint returns
+HTTP 410 Gone for every request shape tried — raw body under three content
+types, multipart, every media type, down to a 247-byte JPEG — and the modern
+CloudKit `assets/upload` route returns a permanent `QUOTA_EXCEEDED` policy
+refusal, retry timer included, on an account sitting at 21.8 GiB used of 200 GiB
+free. The same session's reads and deletes kept working throughout, so this is
+an upload-specific wall, not an auth problem — and it's the same wall pyicloud's
+own upload helper hits, since it targets the same dead endpoint.
+
+So `video-optimise` no longer uploads anything itself. It converts, **you**
+upload — with whatever client Apple still lets do that — and then it
+reconciles the results back into your library.
+
+```bash
+# From the photo root (or pass -d PATH). Needs ffmpeg.
+icloud-photo-sync video-optimise --dry-run          # see the plan, change nothing
+icloud-photo-sync video-optimise --offline          # convert locally, no Apple ID
+icloud-photo-sync video-optimise                    # convert, then reconcile any uploads found
+icloud-photo-sync video-optimise --reconcile-only   # just check iCloud and finish pending swaps
+```
+
+### The flow
+
+1. **Scan and probe** — every video is `ffprobe`d, and the terminal prints what
+   your library is made of and what could be freed.
+2. **Choose** — a browser page lists every video largest-first with the saving
+   each would give. **Nothing is pre-selected.** Videos that were skipped are
+   shown greyed out *with the reason*, so "why isn't my biggest clip here?" is
+   answerable from the page.
+3. **Convert** — one file at a time, into a single flat, visible folder,
+   `optimised/`, at the top of your photo folder. **Your originals are not
+   touched.** When conversion finishes the terminal prints the folder's path
+   and opens it in Finder.
+4. **You upload.** Drag the folder's contents into icloud.com/photos in a
+   browser, into Photos on a Mac (File → Import), or copy them onto an iPhone
+   or iPad and add them from Files. Any device, any pace — this is the one step
+   Apple now reserves for its own clients, so the tool can't do it for you.
+5. **Run `video-optimise` again.** Before it scans anything else, it checks
+   iCloud for uploads you've made, matches each one to the conversion it came
+   from, and — behind a typed confirmation — deletes the originals those
+   uploads replace, offers to move the local originals to the Trash, and slots
+   the optimised copies into your library in their place.
+
+Every long phase is interruptible with Ctrl-C and resumes by re-running the same
+command. Nothing already done is repeated.
+
+### Matching an upload back to its original
+
+Reconciliation is strict on purpose — a wrong guess here deletes the wrong
+video, so an unmatched conversion is left alone rather than resolved by
+best guess.
+
+* A match requires the **filename and the byte size to both be exact**, and the
+  iCloud asset must not already be the row's own original.
+* **If two candidates match one conversion, that conversion is refused** and
+  left alone rather than guessed at.
+* **Nothing is deleted whose replacement isn't verified present.** The
+  replacement is read back from iCloud immediately before its original is
+  touched, even if the matching happened days earlier in an interrupted run.
+
+### Filename collisions
+
+Flattening a dated folder tree into one flat `optimised/` folder collides —
+cameras reuse names across years. On a real library, 647 candidate videos
+shared only 17 basenames; `IMG_0003` alone showed up five times, from five
+different years. A colliding conversion is renamed with the source's year and
+month, e.g. `IMG_0003-2019-06.mov`, so nothing in the folder overwrites
+anything else.
+
+The `optimised/` folder itself is excluded from every scan: `video-clean` won't
+offer these files for trashing, and `video-optimise` won't try to convert its
+own output on a later run.
+
+### Run it again before your next `sync`
+
+If a `sync` lands between uploading and reconciling, it downloads your uploaded
+copies as new files before `video-optimise` gets the chance to match and retire
+the originals they replace — harmless duplicates, but confusing to sort out
+later. Run `video-optimise` (or `--reconcile-only`) first.
+
+### What it does to your footage
+
+The settings are chosen per file from what `ffprobe` finds, not applied
+uniformly:
+
+* **HDR clips stay HDR.** An HLG/BT.2020 10-bit source is re-encoded as HEVC
+  10-bit with its colour tags carried through. It is never converted to H.264 or
+  dropped to 8-bit, which is what makes HDR footage look washed out.
+* **The colour is then checked on the file that came out.** If the transfer,
+  primaries, colourspace or bit depth do not match the source, the conversion is
+  deleted and your original is kept. No clip is uploaded without passing this.
+* **Slow motion keeps its frame rate.** Above 60 fps no frame-rate flag is
+  passed at all — forcing 30 fps on a 240 fps clip would drop seven of every
+  eight frames and play it back at normal speed. A slow-motion clip that is
+  already at the target resolution is skipped entirely.
+* **The shorter side is capped at 1080, never a 1920×1080 box.** A portrait
+  1080×1920 clip stays 1080×1920. Nothing is ever upscaled.
+* **Nothing grows.** If the output is not at least 25% smaller than the input it
+  is thrown away and the original kept.
+* **Capture date, timezone, GPS location and camera model survive**
+  (`com.apple.quicktime.creationdate` and friends), which is what lets Photos
+  file the replacement on the right date.
+
+### What a swap costs you
+
+iCloud has no "replace the bytes of this asset" API, so your uploaded copy is a
+**new asset**. It keeps its capture date, timezone, location and camera model —
+the timeline and Places stay right — but it **permanently loses**:
+
+* album membership, including shared albums
+* Favourite and Hidden status
+* captions, keywords and edits
+* people and face tags
+* its place in Memories
+* its "Added" date, which becomes whenever you uploaded it, so *Recently Added*
+  reorders
+
+For holiday clips that is usually a fair trade. For videos you have curated into
+albums it is not. The confirmation screen says so before anything happens, and
+asks you to type `swap N videos` and then `YES I AM SURE`.
+
+The original is deleted only after its replacement has been read back from
+iCloud and confirmed present — see *Matching an upload back to its original*
+above. Originals go to *Recently Deleted* and are recoverable for 30 days.
+Local originals go to the macOS Trash, never `unlink`, and only after their
+swap is confirmed.
+
+```
+--min-size SIZE      Only consider videos at or above this. Default 20MB.
+--short-side N       Cap the SHORTER side (default 1080; portrait-safe).
+--max-fps N          Frame-rate cap (default 30). Never applied to slow motion.
+--hdr-bitrate RATE   Target for HDR/10-bit sources at 1080p (default 8M).
+--sdr-bitrate RATE   Target for 8-bit sources at 1080p (default 6M).
+--skip-hdr           Leave HDR clips alone entirely.
+--hdr-only           Only convert HDR clips (usually where most of the space is).
+--limit N            Convert at most N this run; re-run for the rest.
+--restart            Throw away the unfinished job and start over.
+--dry-run            Print the exact ffmpeg command per file. Change nothing.
+--offline            Convert only: resolve no Apple ID, touch no network.
+--reconcile-only     Only finish pending uploads: check iCloud, delete, stop.
+--port N             Review server port (0 = auto).
+--no-browser         Print the review URL instead of opening a browser.
+```
+
+**Requires `ffmpeg` with `hevc_videotoolbox`** (`brew install ffmpeg` on Apple
+silicon). The command refuses to start without it rather than falling back to a
+software encoder that would take days.
 
 ---
 

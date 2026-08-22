@@ -64,7 +64,7 @@ def _parse_size(text: str) -> int:
 
 
 def iter_media_files(
-    root: Path, suffixes: set[str]
+    root: Path, suffixes: set[str], exclude: frozenset[str] = frozenset(),
 ) -> Iterator[tuple[Path, str, os.stat_result]]:
     """Yield ``(path, rel, stat)`` for regular files under ``root`` matching ``suffixes``.
 
@@ -72,10 +72,22 @@ def iter_media_files(
     ``._IMG_0042.JPG``), symlinks, and zero-byte files. ``.part`` in-progress
     downloads are excluded by the suffix filter. ``suffixes`` are matched
     case-insensitively; ``rel`` is the posix path relative to ``root``.
+
+    ``exclude`` names **top-level** directories to skip entirely — currently
+    just ``optimised/``, the hand-off folder ``video-optimise`` writes into.
+    That folder has to be visible (Finder and the iOS Files app both hide
+    dot-directories, and the whole point of it is that a person opens it and
+    drags files out), which means every scanner would otherwise walk into it and
+    treat the conversions as library content: ``video-clean`` would offer them
+    for trashing and ``video-optimise`` would try to convert them again.
+    Deliberately top-level only, so a real ``2019/optimised/`` holiday folder
+    somewhere in the tree keeps being scanned.
     """
     root = Path(root).resolve()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if exclude and Path(dirpath) == root:
+            dirnames[:] = [d for d in dirnames if d not in exclude]
         for name in filenames:
             if name.startswith("."):  # AppleDouble sidecars, .DS_Store, etc.
                 continue

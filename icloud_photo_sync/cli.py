@@ -7,6 +7,7 @@ Mental model:  ``sync`` = start,  Ctrl-C = stop,  ``sync`` again = resume,
 from __future__ import annotations
 
 import os
+import re
 import signal
 from pathlib import Path
 from threading import Event
@@ -29,6 +30,7 @@ from .config import (
 )
 from .downloader import Downloader
 from .local_clean import run_local_clean, _parse_size
+from .optimise import run_optimise
 from .video_clean import run_video_clean
 from .errors import (
     AccountPreconditionError,
@@ -91,7 +93,7 @@ def _build_config(ctx: typer.Context, **overrides) -> AppConfig:
     apple_id = cfg.resolve_username(octx.username)
     if not apple_id:
         apple_id = typer.prompt("Apple ID (email)")
-    output_root = (octx.directory or Path.cwd()).resolve()
+    output_root = _output_root(octx)
     config = AppConfig.create(apple_id, output_root, verbose=octx.verbose, **overrides)
     setup_logging(config.logs_dir, config.verbose)
     if octx.reset_keyring:
@@ -126,6 +128,54 @@ def _build_icloud_delete(
     octx: AppContext = ctx.obj
     apple_id = cfg.resolve_username(octx.username) or typer.prompt("Apple ID (email)")
     return ICloudDeleteConfig.create(apple_id, output_root, **overrides)
+
+
+def _parse_bitrate(text: str) -> int:
+    """Parse '8M' / '8Mbps' / '8000k' / '8000000' into bits per second.
+
+    Separate from ``_parse_size`` on purpose: a bitrate is decimal by universal
+    convention (8M means eight million bits, never 8 MiB), and quietly reusing a
+    byte parser here would shift every target by 4.9% without anyone noticing.
+    """
+    s = text.strip().lower().replace(" ", "").removesuffix("bps").removesuffix("bit/s")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmg])?", s)
+    if not m:
+        raise typer.BadParameter(f"invalid bitrate: {text!r} (try 8M, 6000k, 8000000)")
+    factor = {None: 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000}[m.group(2)]
+    value = int(float(m.group(1)) * factor)
+    if value <= 0:
+        raise typer.BadParameter(f"invalid bitrate: {text!r}")
+    return value
+
+
+def _output_root(octx: "AppContext") -> Path:
+    """The photo root: ``-d`` if given, else the shell's current directory.
+
+    Resolving the current directory is the one call here that can fail on a
+    healthy system: when the photo tree lives on an external drive and that
+    drive remounts (unplug, sleep, a second volume coming and going), a shell
+    already sitting inside it keeps a handle to the *old* mount. ``pwd`` still
+    prints the right string, but the real ``getcwd()`` syscall fails — a stack
+    trace pointing at pathlib, which reads as a bug in this tool rather than
+    what it is.
+    """
+    if octx.directory:
+        return Path(octx.directory).resolve()
+    try:
+        return Path.cwd().resolve()
+    except OSError:
+        # _fail, not a raise: no global handler wraps the commands, so an
+        # exception here would just be a prettier stack trace. Exit 2 is the
+        # precondition code the other refusals use.
+        _fail(
+            "Your shell's current directory can no longer be reached — this "
+            "happens when the drive it lives on was remounted (unplugged, "
+            "slept, or reconnected) after the shell entered it.\n"
+            "Either cd into the folder again to re-anchor the shell:\n"
+            '  cd "$(pwd)"\n'
+            "or pass the folder explicitly:  -d /path/to/your/photos", 2,
+        )
+        raise AssertionError("unreachable")  # _fail always raises
 
 
 def _fail(message: str, code: int) -> None:
@@ -337,7 +387,7 @@ def local_clean(
 ) -> None:
     """Find small screenshots/memes locally, review them, move to Trash. No iCloud login unless --icloud-delete."""
     octx: AppContext = ctx.obj
-    output_root = (octx.directory or Path.cwd()).resolve()
+    output_root = _output_root(octx)
 
     flag_categories = tuple(c.strip() for c in flag.split(",") if c.strip())
     bad = [c for c in flag_categories if c not in CATEGORIES]
@@ -387,7 +437,7 @@ def video_clean(
 ) -> None:
     """List downloaded videos largest-first, preview them, move selections to Trash. No iCloud login unless --icloud-delete."""
     octx: AppContext = ctx.obj
-    output_root = (octx.directory or Path.cwd()).resolve()
+    output_root = _output_root(octx)
 
     config = VideoCleanConfig.create(
         output_root,
@@ -400,6 +450,103 @@ def video_clean(
     icloud = _build_icloud_delete(ctx, output_root, enabled=icloud_delete,
                                   dry_run=icloud_dry_run, max_delete=max_delete)
     raise typer.Exit(run_video_clean(config, icloud))
+
+
+@app.command("video-optimise")
+@app.command("video-optimize", hidden=True)
+def video_optimise(
+    ctx: typer.Context,
+    min_size: str = typer.Option(
+        "20MB", "--min-size",
+        help="Only consider videos at or above this size (20MB covers ~90% of video bytes).",
+    ),
+    short_side: int = typer.Option(
+        cfg.DEFAULT_OPTIMISE_SHORT_SIDE, "--short-side",
+        help="Cap the SHORTER side at this many pixels (1080 = 'HD', portrait-safe).",
+    ),
+    max_fps: float = typer.Option(
+        cfg.DEFAULT_OPTIMISE_MAX_FPS, "--max-fps",
+        help="Frame-rate cap. Never applied to slow motion, which keeps its rate.",
+    ),
+    hdr_bitrate: str = typer.Option(
+        "8M", "--hdr-bitrate", help="Target bitrate for HDR/10-bit sources at 1080p."
+    ),
+    sdr_bitrate: str = typer.Option(
+        "6M", "--sdr-bitrate", help="Target bitrate for 8-bit sources at 1080p."
+    ),
+    skip_hdr: bool = typer.Option(
+        False, "--skip-hdr", help="Leave HDR clips alone entirely."
+    ),
+    hdr_only: bool = typer.Option(
+        False, "--hdr-only", help="Only convert HDR clips (where most of the space is)."
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Convert at most N videos this run; re-run for the rest."
+    ),
+    restart: bool = typer.Option(
+        False, "--restart", help="Throw away the unfinished job and start over."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Plan and print the exact ffmpeg command per file. Change nothing."
+    ),
+    offline: bool = typer.Option(
+        False, "--offline", help="Convert only: resolve no Apple ID, touch no network."
+    ),
+    reconcile_only: bool = typer.Option(
+        False, "--reconcile-only",
+        help="Only finish pending uploads: check iCloud, delete replaced originals, stop.",
+    ),
+    port: int = typer.Option(0, "--port", help="Review server port (0 = auto)."),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the review URL instead of opening a browser."
+    ),
+) -> None:
+    """Re-encode oversized videos to 1080p HEVC for you to upload to iCloud.
+
+    Conversions land in an `optimised/` folder for you to upload through Apple's
+    own apps (icloud.com, Photos, or Files on iPhone/iPad) — Apple no longer
+    accepts uploads from anything else. Run the command again afterwards: it
+    checks iCloud for what you uploaded first, then offers to delete the
+    originals those copies replace.
+
+    HDR clips stay HDR and slow motion keeps its frame rate — both are checked on
+    every converted file, and a file failing either check is discarded with its
+    original left untouched.
+    """
+    octx: AppContext = ctx.obj
+    output_root = _output_root(octx)
+
+    # --offline is the credential-free path: no Apple ID is resolved at all.
+    icloud = None if (offline or dry_run) else _build_icloud_delete(
+        ctx, output_root, enabled=True)
+
+    try:
+        config = cfg.VideoOptimiseConfig.create(
+            output_root,
+            apple_id=icloud.app.apple_id if icloud else None,
+            min_bytes=_parse_size(min_size),
+            short_side=short_side,
+            max_fps=max_fps,
+            hdr_bitrate=_parse_bitrate(hdr_bitrate),
+            sdr_bitrate=_parse_bitrate(sdr_bitrate),
+            skip_hdr=skip_hdr or None,
+            hdr_only=hdr_only or None,
+            limit=limit,
+            restart=restart or None,
+            dry_run=dry_run or None,
+            offline=offline or None,
+            reconcile_only=reconcile_only or None,
+            port=port,
+            open_browser=not no_browser,
+            verbose=octx.verbose,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    setup_logging(config.logs_dir, config.verbose)
+    cancel = Event()
+    _install_signal_handlers(cancel)
+    raise typer.Exit(run_optimise(config, icloud, progress=tqdm, cancel=cancel))
 
 
 @app.command("icloud-delete")
@@ -461,7 +608,7 @@ def icloud_delete_cmd(
     Start with --dry-run.
     """
     octx: AppContext = ctx.obj
-    output_root = (octx.directory or Path.cwd()).resolve()
+    output_root = _output_root(octx)
     if not (from_manifest or last or explain or scan_trashed):
         raise typer.BadParameter(
             "pass --from MANIFEST, --last, --explain RECEIPT, or --scan-trashed.")

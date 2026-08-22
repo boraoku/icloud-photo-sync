@@ -61,11 +61,18 @@ class ArmedICloud:
         return f"{self.account_name} <{self.apple_id}>" if self.account_name else self.apple_id
 
 
+ARM_NOTE_TRASH = (
+    "Files you trash will also be offered for deletion from iCloud when the "
+    "review ends — with a final confirmation here."
+)
+
+
 def arm(
     icloud: ICloudDeleteConfig,
     *,
     session_factory: Callable[..., SessionManager] = SessionManager,
     echo: Callable[..., None] = typer.secho,
+    note: str | None = ARM_NOTE_TRASH,
 ) -> ArmedICloud:
     """Prove we could delete, before the user trashes anything. Raises on doubt."""
     echo("Checking your iCloud session…", fg=typer.colors.BLUE)
@@ -100,8 +107,10 @@ def arm(
                         tracked_assets=tracked)
     echo(f"iCloud deletion armed for {armed.who} "
          f"({tracked:,} assets tracked for this folder)", fg=typer.colors.YELLOW)
-    echo("Files you trash will also be offered for deletion from iCloud when the "
-         "review ends — with a final confirmation here.")
+    # ``note`` differs per command: video-optimise trashes nothing, so the
+    # default line would describe something that is not about to happen.
+    if note:
+        echo(note)
     return armed
 
 

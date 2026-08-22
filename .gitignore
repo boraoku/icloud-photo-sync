@@ -26,5 +26,7 @@ dist/
 # output folder.
 /[0-9][0-9][0-9][0-9]/
 /unknown-date/
+# video-optimise's hand-off folder: converted videos awaiting upload.
+/optimised/
 *.part
 .icloud-photo-sync/

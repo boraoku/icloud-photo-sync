@@ -21,7 +21,7 @@ import typer
 from tqdm import tqdm
 
 from . import clean_icloud
-from .config import VIDEO_SUFFIXES, VideoCleanConfig
+from .config import OPTIMISED_DIRNAME, VIDEO_SUFFIXES, VideoCleanConfig
 from .local_clean import iter_media_files
 from .logutil import get_logger
 from .poster import PosterCache, probe_durations
@@ -59,7 +59,10 @@ def scan_videos(root: Path, min_bytes: int = 0) -> list[VideoFile]:
     as a tiebreak, so the order is deterministic.
     """
     found: list[VideoFile] = []
-    for p, rel, st in iter_media_files(root, VIDEO_SUFFIXES):
+    # Skip video-optimise's hand-off folder: those files are this tool's
+    # own output waiting to be uploaded, not library content to trash.
+    for p, rel, st in iter_media_files(root, VIDEO_SUFFIXES,
+                                       frozenset({OPTIMISED_DIRNAME})):
         if st.st_size < min_bytes:
             continue
         found.append(
