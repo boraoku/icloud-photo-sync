@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .state import utc_now_iso
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # --- status vocabulary ---------------------------------------------------
 
@@ -84,6 +84,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     out_bytes      INTEGER,
     out_probe      TEXT,               -- json blob: what the colour check saw
     new_asset_id   TEXT,               -- only ever set after a VERIFIED upload
+    -- When the local side of this row was finished: original trashed and the
+    -- conversion moved into its place. Without it the cleanup had no memory and
+    -- re-offered every swapped row on every run -- and by then the path it
+    -- checks holds the *replacement*, so it trashed the optimised file.
+    local_done     TEXT,
     error          TEXT,
     updated_at     TEXT
 );
@@ -172,10 +177,26 @@ class OptimiseJob:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
             self._migrate_rel_collation()
+            self._migrate_add_local_done()
         self._dirty = 0
         self._last_commit = time.monotonic()
         if not read_only and self.get_meta("schema_version") != SCHEMA_VERSION:
             self.set_meta("schema_version", SCHEMA_VERSION)
+
+    def _migrate_add_local_done(self) -> None:
+        """Add ``local_done`` (schema 2 -> 3). Plain column add, no rebuild.
+
+        Existing ``swapped`` rows are stamped as already done: their local
+        cleanup either happened or was declined, and re-offering it is exactly
+        the bug this column exists to prevent.
+        """
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols or "local_done" in cols:
+            return
+        self._conn.execute("ALTER TABLE jobs ADD COLUMN local_done TEXT")
+        self._conn.execute(
+            "UPDATE jobs SET local_done = ? WHERE status = ?", (_now(), STATUS_SWAPPED))
+        self._conn.commit()
 
     def _migrate_rel_collation(self) -> None:
         """Rebuild ``jobs`` with a case-insensitive key (schema 1 -> 2).
@@ -461,6 +482,25 @@ class OptimiseJob:
             "SELECT * FROM jobs WHERE status IN ('converted', 'uploaded') "
             "ORDER BY src_bytes DESC"
         ).fetchall()
+
+    def needs_local_cleanup(self) -> list[sqlite3.Row]:
+        """Swapped rows whose local side has not been finished yet.
+
+        The cleanup is offered from here rather than from :meth:`swapped` so it
+        is asked once per video, ever.
+        """
+        return self._conn.execute(
+            "SELECT * FROM jobs WHERE status = 'swapped' AND local_done IS NULL "
+            "ORDER BY updated_at"
+        ).fetchall()
+
+    def mark_local_done(self, rel: str) -> None:
+        """Record that this row's original is gone and its conversion is placed."""
+        self._conn.execute(
+            "UPDATE jobs SET local_done = ?, updated_at = ? WHERE rel = ?",
+            (_now(), _now(), rel),
+        )
+        self._maybe_commit()
 
     def swapped(self) -> list[sqlite3.Row]:
         return self._conn.execute(

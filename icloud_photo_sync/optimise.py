@@ -746,22 +746,47 @@ def _cleanup_locals(
 ) -> int:
     """Offer to Trash the originals of swapped videos, then move the copies in.
 
-    Only ``swapped`` rows are eligible, and they go to the Trash rather than
-    being unlinked: a swap that turns out to have been a mistake is recoverable
-    from Recently Deleted for thirty days, and this keeps the local side
-    recoverable for as long as the user's Trash holds.
+    Only ``swapped`` rows that have not already been cleaned up are eligible,
+    and they go to the Trash rather than being unlinked: a swap that turns out
+    to have been a mistake stays recoverable for as long as the Trash holds.
+
+    Two guards, because getting this wrong destroys the *replacement* rather
+    than the original. ``needs_local_cleanup`` asks the question once per video
+    ever, and :func:`_is_still_the_original` re-checks by size immediately
+    before trashing. The second exists because after a successful cleanup the
+    original's path and the conversion's path are the same path on a
+    case-insensitive volume — so "the original is still there" cannot be
+    answered by ``exists()``, and a run that asked again would trash the
+    optimised file it had just put there.
     """
-    rows = job.swapped()
-    originals = [(row, config.output_root / row["rel"]) for row in rows]
-    live = [(row, path) for row, path in originals if path.is_file()]
+    rows = job.needs_local_cleanup()
+    live: list = []
+    puzzling: list = []
+    for row in rows:
+        path = config.output_root / row["rel"]
+        state = _local_state(row, path)
+        if state == "original":
+            live.append((row, path))
+        elif state == "unknown":
+            # Present, but neither the size we recorded for the original nor for
+            # the conversion. Something outside this tool changed it, so neither
+            # trashing it nor declaring the row finished is defensible.
+            puzzling.append((row, path))
+        else:
+            job.mark_local_done(row["rel"])     # gone, or already replaced
+
+    for row, path in puzzling:
+        echo(f"  ? {row['rel']}: unexpected size on disk — left alone",
+             fg=typer.colors.YELLOW)
     if not live:
         return 0
+
     total = sum(path.stat().st_size for _, path in live)
     echo("")
     if not confirm(f"Move the {len(live)} local original(s) to the Trash? "
                    f"({_size(total)})"):
-        echo("Kept. The optimised copies are in "
-             f"{config.work_dir}.", fg=typer.colors.YELLOW)
+        echo(f"Kept. The optimised copies are in {config.work_dir}.",
+             fg=typer.colors.YELLOW)
         return 0
 
     results = trash_fn([path for _, path in live])
@@ -777,14 +802,42 @@ def _cleanup_locals(
     # completed asset with nothing at its recorded path and fetch it again.
     placed = 0
     state_ctx = StateStore(state_db) if state_db is not None else _NoState()
-    with state_ctx as state:
+    with state_ctx as store:
         for row, path in live:
-            if path in moved and _place_converted(row, config, state):
+            if path not in moved:
+                continue
+            if _place_converted(row, config, store):
                 placed += 1
+            job.mark_local_done(row["rel"])
     if placed:
         echo(f"  ✓ {placed} optimised file(s) moved into the library.",
              fg=typer.colors.GREEN)
     return len(failed)
+
+
+def _local_state(row, path: Path) -> str:
+    """What is sitting at the original's path: the original, or its replacement?
+
+    Answered by size, which is a measurement rather than bookkeeping — the row
+    records both, and they differ by construction, since a conversion is only
+    kept when it is at least 25% smaller.
+
+    This distinction cannot be made by ``exists()``: after a successful cleanup
+    the conversion has *taken the original's place*, and on a case-insensitive
+    volume ``IMG_1.MOV`` and ``IMG_1.mov`` are one file. A run that asked again
+    would find "the original" present and trash the optimised video.
+
+    Returns ``"gone"``, ``"replaced"``, ``"original"`` or ``"unknown"``.
+    """
+    try:
+        actual = path.stat().st_size
+    except OSError:
+        return "gone"
+    if row["out_bytes"] and actual == row["out_bytes"]:
+        return "replaced"
+    if actual == row["src_bytes"]:
+        return "original"
+    return "unknown"
 
 
 class _NoState:

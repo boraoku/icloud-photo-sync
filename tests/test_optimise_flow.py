@@ -50,6 +50,12 @@ def job(config):
         yield store
 
 
+def _sparse(path: Path, size: int) -> None:
+    """A file that really is ``size`` bytes, without occupying them."""
+    with open(path, "wb") as fh:
+        fh.truncate(size)
+
+
 def seed_converted(job, config, *, rel="2024/05/IMG_1.MOV", asset_id="OLD",
                    src_bytes=300 * 1024 * 1024, out_bytes=25 * 1024 * 1024):
     """A row that has been converted and is waiting to be swapped."""
@@ -59,11 +65,11 @@ def seed_converted(job, config, *, rel="2024/05/IMG_1.MOV", asset_id="OLD",
             src_probe=op._probe_dict(source), plan=op._encode_dict(encode))
     src = config.output_root / rel
     src.parent.mkdir(parents=True, exist_ok=True)
-    src.write_bytes(b"o" * 32)
+    _sparse(src, src_bytes)          # real recorded size, no real bytes on disk
     name = vo.flat_name(rel)
     out = config.work_path(name)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(b"x" * out_bytes)
+    _sparse(out, out_bytes)
     output = make_probe(rel=rel, size=out_bytes, width=1080, height=1920, fps=30.0)
     job.mark_converted(rel, out_rel=name, out_bytes=out_bytes,
                        out_probe=op._probe_dict(output))
@@ -150,7 +156,7 @@ def seed_selected(job, config, *, rel="2024/05/IMG_1.MOV", size=300 * 1024 * 102
             plan=op._encode_dict(vo.choose_encode(source)))
     src = config.output_root / rel
     src.parent.mkdir(parents=True, exist_ok=True)
-    src.write_bytes(b"o" * 64)
+    _sparse(src, size)
     return rel, source
 
 
@@ -604,3 +610,140 @@ class TestWorkDirMigration:
         job.reset_swap_failed()
         assert op._migrate_work_dir(job, config, lambda *a, **k: None) == 1
         assert config.work_path("IMG_1.mov").is_file()
+
+
+# --- local cleanup is asked once, and never eats the replacement --------------
+
+
+class TestLocalCleanupIsIdempotent:
+    """The bug this pins down destroyed real files.
+
+    After a successful cleanup the original is in the Trash and the conversion
+    has taken its place — and on a case-insensitive volume that is the *same
+    path*. A second run re-offered every swapped row, found a file at the
+    original's path, and trashed it: the optimised video, not the original.
+    """
+
+    def _trash(self, seen):
+        from icloud_photo_sync.trash import TrashResult
+
+        def fn(paths):
+            seen.extend(paths)
+            for p in paths:
+                p.unlink(missing_ok=True)
+            return [TrashResult(path=p, ok=True) for p in paths]
+        return fn
+
+    def _swapped(self, job, config, rel="2024/05/IMG_1.MOV"):
+        seed_converted(job, config, rel=rel)
+        job.mark_uploaded(rel, "NEW")
+        job.mark_swapped(rel)
+        return rel
+
+    def _cleanup(self, job, config, seen, *, yes=True):
+        return op._cleanup_locals(job, config, echo=lambda *a, **k: None,
+                                  confirm=lambda *a, **k: yes,
+                                  trash_fn=self._trash(seen))
+
+    def test_a_second_run_does_not_trash_the_replacement(self, job, config):
+        rel = self._swapped(job, config)
+        first: list[Path] = []
+        self._cleanup(job, config, first)
+        assert [p.name for p in first] == ["IMG_1.MOV"]
+        placed = (config.output_root / rel).with_suffix(".mov")
+        assert placed.is_file()
+
+        second: list[Path] = []
+        self._cleanup(job, config, second)
+        assert second == []                    # nothing offered, nothing trashed
+        assert placed.is_file()                # the optimised file survives
+
+    def test_the_row_is_stamped_so_it_is_never_asked_again(self, job, config):
+        rel = self._swapped(job, config)
+        self._cleanup(job, config, [])
+        assert job.get(rel)["local_done"]
+        assert job.needs_local_cleanup() == []
+
+    def test_declining_leaves_the_row_to_ask_again(self, job, config):
+        rel = self._swapped(job, config)
+        seen: list[Path] = []
+        self._cleanup(job, config, seen, yes=False)
+        assert seen == []
+        assert job.get(rel)["local_done"] is None
+        assert len(job.needs_local_cleanup()) == 1
+
+    def test_a_file_the_size_of_the_conversion_is_never_trashed(self, job, config):
+        # The size guard on its own, with the marker deliberately cleared: even
+        # a row that somehow came back round must not eat the replacement.
+        rel = self._swapped(job, config)
+        self._cleanup(job, config, [])
+        job._conn.execute("UPDATE jobs SET local_done = NULL WHERE rel = ?", (rel,))
+        job.flush()
+        seen: list[Path] = []
+        self._cleanup(job, config, seen)
+        assert seen == []
+        assert (config.output_root / rel).with_suffix(".mov").is_file()
+
+    def test_an_already_missing_original_is_stamped_not_re_offered(self, job, config):
+        rel = self._swapped(job, config)
+        (config.output_root / rel).unlink()
+        seen: list[Path] = []
+        self._cleanup(job, config, seen)
+        assert seen == [] and job.get(rel)["local_done"]
+
+    def test_an_unexpected_size_is_left_alone_and_re_offered(self, job, config):
+        # Neither trashed nor stamped: the run says so and moves on, and a
+        # later run can still deal with it once the user knows.
+        rel = seed_converted(job, config)
+        job.mark_uploaded(rel, "NEW")
+        job.mark_swapped(rel)
+        with open(config.output_root / rel, "wb") as fh:
+            fh.truncate(12345)                 # neither recorded size
+        seen: list[Path] = []
+        from icloud_photo_sync.trash import TrashResult
+
+        def trash(paths):
+            seen.extend(paths)
+            return [TrashResult(path=p, ok=True) for p in paths]
+
+        op._cleanup_locals(job, config, echo=lambda *a, **k: None,
+                           confirm=lambda *a, **k: True, trash_fn=trash)
+        assert seen == []
+        assert job.get(rel)["local_done"] is None
+        assert (config.output_root / rel).is_file()
+
+    def test_the_original_is_still_trashed_when_it_really_is_the_original(self, job, config):
+        rel = self._swapped(job, config)
+        seen: list[Path] = []
+        assert self._cleanup(job, config, seen) == 0
+        assert [p.name for p in seen] == ["IMG_1.MOV"]
+
+
+class TestLocalState:
+    """Which of the two files is sitting at the original's path."""
+
+    def _row(self, src, out):
+        return {"src_bytes": src, "out_bytes": out}
+
+    def _file(self, tmp_path, size):
+        p = tmp_path / "a.mov"
+        with open(p, "wb") as fh:
+            fh.truncate(size)
+        return p
+
+    def test_the_original_is_recognised(self, tmp_path):
+        assert op._local_state(self._row(100, 10),
+                               self._file(tmp_path, 100)) == "original"
+
+    def test_the_replacement_is_recognised_and_never_offered(self, tmp_path):
+        assert op._local_state(self._row(100, 10),
+                               self._file(tmp_path, 10)) == "replaced"
+
+    def test_a_missing_file_means_the_local_side_is_finished(self, tmp_path):
+        assert op._local_state(self._row(100, 10), tmp_path / "no.mov") == "gone"
+
+    def test_an_unexpected_size_is_neither(self, tmp_path):
+        # Something outside this tool changed it: not safe to trash, not
+        # honest to call finished.
+        assert op._local_state(self._row(100, 10),
+                               self._file(tmp_path, 55)) == "unknown"
