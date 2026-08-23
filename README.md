@@ -574,6 +574,19 @@ so anything still present there at the same size is left alone.
   `YYYY/MM/name` with exactly the size iCloud reports (e.g. you re-point the tool
   at an old export, or the manifest was lost), it is marked complete instead of
   being downloaded again.
+* **Missing capture-date metadata is backfilled.** Files shared via WhatsApp (and
+  some other apps) strip embedded date metadata before you re-import them, so a
+  video or photo that reaches iCloud that way carries no capture date of its own
+  — only iCloud's own record does. If a re-import ever happens by hand later
+  (e.g. after `video-optimise`), the file's filesystem modified-time is what
+  decides the date, so `sync` sets it to the true capture date on every
+  download, and — only when the file's own embedded date is genuinely absent —
+  writes it in too. A date that's already present, even one that looks wrong,
+  is never touched. The embedded-date half needs `exiftool` for photos
+  (`brew install exiftool`; videos use the `ffmpeg`/`ffprobe` you already have)
+  — without it, download still succeeds and the filesystem date is still fixed,
+  you just don't get the embedded stamp. `video-optimise` carries the same date
+  forward onto its converted output.
 
 ### Where things live
 

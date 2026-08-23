@@ -1,0 +1,427 @@
+"""Tests for icloud_photo_sync.metadata: presence checks, stamping, mtime.
+
+No real ffmpeg/ffprobe/exiftool calls: every test monkeypatches
+``subprocess.run`` and ``shutil.which``, so the whole file passes on a
+machine with none of those tools installed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from icloud_photo_sync import metadata as md
+
+
+@pytest.fixture(autouse=True)
+def _clear_tool_cache():
+    """Availability is memoised across calls; tests must not see each other."""
+    md._tool_cache.clear()
+    yield
+    md._tool_cache.clear()
+
+
+def _which_present(*names: str):
+    present = set(names)
+
+    def which(name):
+        return f"/usr/bin/{name}" if name in present else None
+
+    return which
+
+
+CAPTURE_DT = datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+
+
+# --- availability ----------------------------------------------------------------
+
+
+def test_exiftool_available_reflects_which_and_is_cached(monkeypatch):
+    calls = []
+
+    def which(name):
+        calls.append(name)
+        return "/usr/bin/exiftool" if name == "exiftool" else None
+
+    monkeypatch.setattr(md.shutil, "which", which)
+
+    assert md.exiftool_available() is True
+    assert md.exiftool_available() is True
+    assert calls == ["exiftool"]                # second call served from cache
+
+
+def test_ffmpeg_pair_available_requires_both_tools(monkeypatch):
+    monkeypatch.setattr(md.shutil, "which", _which_present("ffmpeg"))
+    assert md.ffmpeg_pair_available() is False
+
+    md._tool_cache.clear()
+    monkeypatch.setattr(md.shutil, "which", _which_present("ffmpeg", "ffprobe"))
+    assert md.ffmpeg_pair_available() is True
+
+
+# --- _video_has_date ---------------------------------------------------------------
+
+
+def _ffprobe_tags_run(tags):
+    def run(argv, **kwargs):
+        payload = {"format": {"tags": tags}} if tags is not None else {"format": {}}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+    return run
+
+
+def test_video_has_date_true_when_creation_time_present(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(subprocess, "run", _ffprobe_tags_run({"creation_time": "2019-10-25T15:07:50Z"}))
+    assert md._video_has_date(src) is True
+
+
+def test_video_has_date_true_when_only_quicktime_tag_present(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        _ffprobe_tags_run({"com.apple.quicktime.creationdate": "2019-10-25T18:07:50+0300"}),
+    )
+    assert md._video_has_date(src) is True
+
+
+def test_video_has_date_false_when_neither_tag_present(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(subprocess, "run", _ffprobe_tags_run({}))
+    assert md._video_has_date(src) is False
+
+
+def test_video_has_date_none_on_nonzero_exit(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    assert md._video_has_date(src) is None
+
+
+def test_video_has_date_none_on_subprocess_error(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+
+    def run(argv, **kw):
+        raise OSError("ffprobe not found")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert md._video_has_date(src) is None
+
+
+def test_video_has_date_none_on_malformed_json(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(returncode=0, stdout="not json", stderr=""),
+    )
+    assert md._video_has_date(src) is None
+
+
+# --- _image_has_date ---------------------------------------------------------------
+
+
+def test_image_has_date_true_when_a_tag_line_is_non_blank(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(returncode=0, stdout="2019:10:25 15:07:50\n\n", stderr=""),
+    )
+    assert md._image_has_date(src) is True
+
+
+def test_image_has_date_false_when_both_lines_blank(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(returncode=0, stdout="\n\n", stderr=""),
+    )
+    assert md._image_has_date(src) is False
+
+
+def test_image_has_date_none_on_nonzero_exit(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    assert md._image_has_date(src) is None
+
+
+# --- _stamp_video ------------------------------------------------------------------
+
+
+def test_stamp_video_names_the_container_explicitly(tmp_path, monkeypatch):
+    """Regression: a bare ``.meta.part`` name gives ffmpeg nothing to infer a
+    container from (verified against real ffmpeg: it refuses outright)."""
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"original bytes")
+    captured = {}
+
+    def run(argv, **kw):
+        captured["argv"] = argv
+        part = tmp_path / "clip.mov.meta.part"
+        part.write_bytes(b"remuxed bytes")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert md._stamp_video(src, CAPTURE_DT, None) is True
+    assert src.read_bytes() == b"remuxed bytes"
+    assert not (tmp_path / "clip.mov.meta.part").exists()
+    argv = captured["argv"]
+    assert argv[-3:-1] == ["-f", "mov"]
+    assert any(a.startswith("creation_time=2019-10-25T15:07:50Z") for a in argv)
+    assert any(a.startswith("com.apple.quicktime.creationdate=2019-10-25T15:07:50+0000") for a in argv)
+
+
+def test_stamp_video_uses_given_tz_offset(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    captured = {}
+
+    def run(argv, **kw):
+        captured["argv"] = argv
+        (tmp_path / "clip.mov.meta.part").write_bytes(b"y")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    md._stamp_video(src, CAPTURE_DT, 11 * 3600)
+
+    assert any(
+        a.startswith("com.apple.quicktime.creationdate=2019-10-26T02:07:50+1100")
+        for a in captured["argv"]
+    )
+
+
+def test_stamp_video_leaves_no_part_file_on_nonzero_exit(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"original")
+
+    def run(argv, **kw):
+        (tmp_path / "clip.mov.meta.part").write_bytes(b"partial")
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert md._stamp_video(src, CAPTURE_DT, None) is False
+    assert src.read_bytes() == b"original"
+    assert not (tmp_path / "clip.mov.meta.part").exists()
+
+
+def test_stamp_video_leaves_no_part_file_on_subprocess_error(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"original")
+
+    def run(argv, **kw):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert md._stamp_video(src, CAPTURE_DT, None) is False
+    assert src.read_bytes() == b"original"
+
+
+# --- _stamp_image ------------------------------------------------------------------
+
+
+def test_stamp_image_writes_via_dash_o_and_swaps_in(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"original")
+    captured = {}
+
+    def run(argv, **kw):
+        captured["argv"] = argv
+        (tmp_path / "photo.heic.meta.part").write_bytes(b"stamped")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert md._stamp_image(src, CAPTURE_DT, None) is True
+    assert src.read_bytes() == b"stamped"
+    assert not (tmp_path / "photo.heic.meta.part").exists()
+    argv = captured["argv"]
+    assert "-o" in argv
+    assert any(a == "-DateTimeOriginal=2019:10:25 15:07:50" for a in argv)
+
+
+def test_stamp_image_leaves_no_part_file_on_failure(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"original")
+
+    def run(argv, **kw):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert md._stamp_image(src, CAPTURE_DT, None) is False
+    assert src.read_bytes() == b"original"
+    assert not (tmp_path / "photo.heic.meta.part").exists()
+
+
+# --- ensure_capture_date -----------------------------------------------------------
+
+
+def _mtime(path):
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+
+
+def test_unsupported_type_sets_mtime_only(tmp_path, monkeypatch):
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(md.shutil, "which", _which_present())
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+
+    assert outcome is md.MetadataOutcome.UNSUPPORTED_TYPE
+    assert _mtime(src) == CAPTURE_DT
+
+
+def test_tool_unavailable_still_sets_mtime(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(md.shutil, "which", _which_present())          # neither tool
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+
+    assert outcome is md.MetadataOutcome.TOOL_UNAVAILABLE
+    assert _mtime(src) == CAPTURE_DT
+
+
+def test_already_present_video_is_never_stamped(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(md.shutil, "which", _which_present("ffmpeg", "ffprobe"))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"format": {"tags": {"creation_time": "already there"}}}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+
+    assert outcome is md.MetadataOutcome.ALREADY_PRESENT
+    assert len(calls) == 1                       # only the read, never a write
+    assert _mtime(src) == CAPTURE_DT              # mtime still set unconditionally
+
+
+def test_missing_video_date_is_stamped_and_final_mtime_is_the_capture_date(tmp_path, monkeypatch):
+    """Regression for the bug caught in live testing: a successful stamp
+    replaces the file via os.replace() with a freshly-written temp file whose
+    own mtime is "now". If the mtime were set *before* that swap, the swap
+    would silently clobber it — this asserts the final file carries the true
+    capture date, not the moment the stamp subprocess ran.
+    """
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"original")
+    monkeypatch.setattr(md.shutil, "which", _which_present("ffmpeg", "ffprobe"))
+
+    def run(argv, **kw):
+        if argv[0] == "ffprobe":
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"format": {"tags": {}}}), stderr="")
+        # ffmpeg: simulate a freshly-written temp file with a "wrong" mtime,
+        # the way a real ffmpeg process naturally would.
+        part = tmp_path / "clip.mov.meta.part"
+        part.write_bytes(b"remuxed")
+        wrong = datetime(2026, 8, 23, tzinfo=timezone.utc).timestamp()
+        os.utime(part, (wrong, wrong))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT, tz_offset_seconds=11 * 3600)
+
+    assert outcome is md.MetadataOutcome.STAMPED
+    assert src.read_bytes() == b"remuxed"
+    assert _mtime(src) == CAPTURE_DT
+
+
+def test_ensure_capture_date_sets_mtime_even_when_stamp_fails(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(md.shutil, "which", _which_present("ffmpeg", "ffprobe"))
+
+    def run(argv, **kw):
+        if argv[0] == "ffprobe":
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"format": {"tags": {}}}), stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+
+    assert outcome is md.MetadataOutcome.FAILED
+    assert _mtime(src) == CAPTURE_DT
+
+
+def test_ensure_capture_date_never_raises_when_utime_fails(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(md.shutil, "which", _which_present())
+
+    def bad_utime(path, times):
+        raise OSError("no permission")
+
+    monkeypatch.setattr(md.os, "utime", bad_utime)
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+    assert outcome is md.MetadataOutcome.TOOL_UNAVAILABLE
+
+
+def test_missing_image_date_is_stamped(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"original")
+    monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+
+    def run(argv, **kw):
+        if "-s3" in argv:
+            return SimpleNamespace(returncode=0, stdout="\n\n", stderr="")
+        part = tmp_path / "photo.heic.meta.part"
+        part.write_bytes(b"stamped")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+
+    assert outcome is md.MetadataOutcome.STAMPED
+    assert src.read_bytes() == b"stamped"
+    assert _mtime(src) == CAPTURE_DT
+
+
+def test_already_present_image_is_never_stamped(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="2019:10:25 15:07:50\n\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    outcome = md.ensure_capture_date(src, CAPTURE_DT)
+
+    assert outcome is md.MetadataOutcome.ALREADY_PRESENT
+    assert len(calls) == 1

@@ -22,6 +22,8 @@ from icloud_photo_sync import video_optimise as vo
 from icloud_photo_sync.config import VideoOptimiseConfig
 from icloud_photo_sync.errors import ICloudSyncError
 from icloud_photo_sync.icloud_client import DeleteResult, RemoteAsset
+from icloud_photo_sync.metadata import MetadataOutcome
+from icloud_photo_sync.models import AssetRef
 from icloud_photo_sync.state import StateStore
 from icloud_photo_sync.transcode import ConvertResult
 
@@ -274,6 +276,101 @@ class TestConversionGate:
         # ffmpeg invocation would have received.
         assert seen_encodes[0].pix_fmt == vo.PIX_FMT_8BIT
         assert seen_encodes[0].profile == vo.PROFILE_8BIT
+        assert job.get(rel)["status"] == oj.STATUS_CONVERTED
+
+
+class TestCaptureDateStamping:
+    """_convert_all consults the sync manifest for the source's true capture
+    date and stamps the converted output — the video-optimise half of the
+    WhatsApp-strips-metadata fix; see icloud_photo_sync.metadata."""
+
+    def _state_db(self, tmp_path):
+        from icloud_photo_sync.config import AppConfig
+        app = AppConfig.create("t@e.com", tmp_path / "tree", config_root=tmp_path / "cfg")
+        return app.state_db
+
+    def _register(self, state_db, asset_id, capture_dt, rel):
+        with StateStore(state_db) as state:
+            asset = AssetRef(id=asset_id, filename=Path(rel).name,
+                             capture_dt=capture_dt, added_dt=None, size=None)
+            state.register(asset, rel)
+
+    def _convert_with_state(self, job, config, state_db, *, monkeypatch, calls, rel):
+        def fake_ensure(path, capture_dt, **kw):
+            calls.append((path, capture_dt))
+            return MetadataOutcome.STAMPED
+
+        monkeypatch.setattr(op.md, "ensure_capture_date", fake_ensure)
+        return op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+            state_db=state_db,
+        )
+
+    def test_stamps_the_output_with_the_manifest_capture_date(self, job, config, monkeypatch, tmp_path):
+        rel, _ = seed_selected(job, config)
+        state_db = self._state_db(tmp_path)
+        capture_dt = datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+        self._register(state_db, "OLD", capture_dt, rel)
+        calls = []
+
+        totals = self._convert_with_state(job, config, state_db, monkeypatch=monkeypatch,
+                                          calls=calls, rel=rel)
+
+        assert totals.converted == 1
+        assert len(calls) == 1
+        stamped_path, stamped_dt = calls[0]
+        assert stamped_path == config.work_path(vo.flat_name(rel))
+        assert stamped_dt == capture_dt
+
+    def test_no_stamp_call_when_manifest_has_no_row_for_the_asset(self, job, config, monkeypatch, tmp_path):
+        rel, _ = seed_selected(job, config)
+        state_db = self._state_db(tmp_path)
+        with StateStore(state_db):
+            pass                            # DB created, but no row for "OLD"
+        calls = []
+
+        self._convert_with_state(job, config, state_db, monkeypatch=monkeypatch,
+                                 calls=calls, rel=rel)
+
+        assert calls == []
+
+    def test_no_stamp_call_when_state_db_not_given(self, job, config, monkeypatch):
+        rel, _ = seed_selected(job, config)
+        calls = []
+
+        def fake_ensure(path, capture_dt, **kw):
+            calls.append(1)
+
+        monkeypatch.setattr(op.md, "ensure_capture_date", fake_ensure)
+        totals = op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+        )
+
+        assert totals.converted == 1
+        assert calls == []
+
+    def test_conversion_still_succeeds_when_stamping_reports_failed(self, job, config, monkeypatch, tmp_path):
+        rel, _ = seed_selected(job, config)
+        state_db = self._state_db(tmp_path)
+        self._register(state_db, "OLD", datetime(2019, 10, 25, tzinfo=timezone.utc), rel)
+
+        monkeypatch.setattr(op.md, "ensure_capture_date",
+                            lambda *a, **kw: MetadataOutcome.FAILED)
+        totals = op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+            state_db=state_db,
+        )
+
+        assert totals.converted == 1
         assert job.get(rel)["status"] == oj.STATUS_CONVERTED
 
 

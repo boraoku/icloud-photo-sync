@@ -43,6 +43,7 @@ from typing import Callable, Sequence
 import typer
 
 from . import icloud_client as ic
+from . import metadata as md
 from . import optimise_job as oj
 from . import optimise_review as orv
 from . import transcode as tc
@@ -252,6 +253,7 @@ def _convert_all(
     cancel: Event | None = None,
     convert_fn=tc.convert,
     probe_fn=tc.probe,
+    state_db: Path | None = None,
 ) -> Totals:
     """Encode every ``selected`` row, verifying colour and size on the output.
 
@@ -273,6 +275,12 @@ def _convert_all(
     taken |= {r["out_rel"] for r in job.by_status(
         oj.STATUS_CONVERTED, oj.STATUS_REJECTED, oj.STATUS_UPLOADED,
         oj.STATUS_SWAPPED) if r["out_rel"]}
+
+    # Read-only, opened once for the whole batch rather than per row: a source
+    # that predates the download-time stamp (fix 1) — or that fix 1 never
+    # reached, e.g. --offline — is exactly the case this closes, by consulting
+    # the same manifest sync already trusts for the capture date it recorded.
+    manifest = StateStore(state_db, read_only=True) if state_db is not None else None
 
     bar = progress(total=len(rows), desc="Converting", unit="video") if progress else None
     try:
@@ -354,6 +362,8 @@ def _convert_all(
                     bar.update(1)
                 continue
 
+            _stamp_converted(dest, row["asset_id"], manifest)
+
             job.mark_converted(rel, out_rel=name, out_bytes=result.size,
                                out_probe=_probe_dict(output))
             totals.converted += 1
@@ -366,7 +376,27 @@ def _convert_all(
     finally:
         if bar:
             bar.close()
+        if manifest is not None:
+            manifest.close()
     return totals
+
+
+def _stamp_converted(dest: Path, asset_id: str | None, manifest: StateStore | None) -> None:
+    """Best-effort: give the converted file the source's true capture date
+    when the manifest still knows it and the file doesn't carry one — see
+    :mod:`icloud_photo_sync.metadata`. A no-op offline, for a row the manifest
+    never saw, or once asset-id backfill hasn't reached this row yet.
+    """
+    if manifest is None or not asset_id:
+        return
+    state_row = manifest.get(asset_id)
+    if state_row is None or not state_row["capture_dt"]:
+        return
+    try:
+        capture_dt = datetime.fromisoformat(state_row["capture_dt"])
+    except ValueError:
+        return
+    md.ensure_capture_date(dest, capture_dt)
 
 
 def _colour_arrow(source: vo.VideoProbe, output: vo.VideoProbe) -> str:
@@ -1121,7 +1151,7 @@ def _run_phases(
             return 0
 
     totals = _convert_all(job, config, echo=echo, progress=progress, cancel=cancel,
-                          convert_fn=convert_fn, probe_fn=probe_fn)
+                          convert_fn=convert_fn, probe_fn=probe_fn, state_db=state_db)
     if cancel is not None and cancel.is_set():
         return 130
 

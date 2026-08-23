@@ -8,11 +8,14 @@ a deterministic fake client where timing matters.
 
 import os
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import requests
 
+from icloud_photo_sync import downloader as dlmod
+from icloud_photo_sync import metadata as md
 from icloud_photo_sync.config import AppConfig
 from icloud_photo_sync.downloader import Downloader
 from icloud_photo_sync.errors import OperationCancelled, TransientError
@@ -56,9 +59,9 @@ class FakeRaw:
         return True
 
 
-def make_asset(blob, url=None, id="a1", filename="IMG.HEIC", size="auto"):
+def make_asset(blob, url=None, id="a1", filename="IMG.HEIC", size="auto", capture_dt=None):
     return AssetRef(
-        id=id, filename=filename, capture_dt=None, added_dt=None,
+        id=id, filename=filename, capture_dt=capture_dt, added_dt=None,
         size=(len(blob) if size == "auto" else size),
         raw=FakeRaw(url) if url else None,
     )
@@ -132,6 +135,81 @@ def test_full_download(tmp_path):
         assert dl.download(asset, dest) == DownloadOutcome.DOWNLOADED
         assert dest.read_bytes() == blob
         assert not dest.with_name("out.bin.part").exists()
+        assert state.get("a1")["status"] == "completed"
+    finally:
+        srv.shutdown(); state.close()
+
+
+def test_stamps_capture_date_on_a_completed_download(tmp_path, monkeypatch):
+    """The hook this session added: a fresh download with a known capture
+    date gets it stamped in, using the asset's own timezone offset when the
+    engine exposes one."""
+    blob = os.urandom(2000)
+    srv, port, _ = start_server(blob, mode="range")
+    dl, state = http_downloader(tmp_path)
+    calls = []
+
+    def fake_ensure(path, capture_dt, *, tz_offset_seconds=None):
+        calls.append((path, capture_dt, tz_offset_seconds))
+        return md.MetadataOutcome.STAMPED
+
+    monkeypatch.setattr(dlmod.md, "ensure_capture_date", fake_ensure)
+    monkeypatch.setattr(dlmod, "asset_timezone_offset", lambda raw: 3 * 3600)
+    try:
+        capture_dt = datetime(2019, 10, 25, tzinfo=timezone.utc)
+        asset = make_asset(blob, url=f"http://127.0.0.1:{port}/f", capture_dt=capture_dt)
+        dest = tmp_path / "out.bin"
+        state.register(asset, dest.name)
+
+        assert dl.download(asset, dest) == DownloadOutcome.DOWNLOADED
+
+        assert len(calls) == 1
+        stamped_path, stamped_dt, tz = calls[0]
+        assert stamped_path == dest
+        assert stamped_dt == capture_dt
+        assert tz == 3 * 3600
+    finally:
+        srv.shutdown(); state.close()
+
+
+def test_no_stamp_call_when_capture_date_unknown(tmp_path, monkeypatch):
+    blob = os.urandom(2000)
+    srv, port, _ = start_server(blob, mode="range")
+    dl, state = http_downloader(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        dlmod.md, "ensure_capture_date",
+        lambda *a, **kw: calls.append(1) or md.MetadataOutcome.STAMPED,
+    )
+    try:
+        asset = make_asset(blob, url=f"http://127.0.0.1:{port}/f", capture_dt=None)
+        dest = tmp_path / "out.bin"
+        state.register(asset, dest.name)
+
+        assert dl.download(asset, dest) == DownloadOutcome.DOWNLOADED
+        assert calls == []
+    finally:
+        srv.shutdown(); state.close()
+
+
+def test_download_still_succeeds_when_stamping_reports_failed(tmp_path, monkeypatch):
+    """Best-effort boundary: a stamping FAILED/TOOL_UNAVAILABLE outcome must
+    never turn a successful, byte-verified download into a failure."""
+    blob = os.urandom(2000)
+    srv, port, _ = start_server(blob, mode="range")
+    dl, state = http_downloader(tmp_path)
+    monkeypatch.setattr(
+        dlmod.md, "ensure_capture_date",
+        lambda *a, **kw: md.MetadataOutcome.TOOL_UNAVAILABLE,
+    )
+    try:
+        capture_dt = datetime(2019, 10, 25, tzinfo=timezone.utc)
+        asset = make_asset(blob, url=f"http://127.0.0.1:{port}/f", capture_dt=capture_dt)
+        dest = tmp_path / "out.bin"
+        state.register(asset, dest.name)
+
+        assert dl.download(asset, dest) == DownloadOutcome.DOWNLOADED
+        assert dest.read_bytes() == blob
         assert state.get("a1")["status"] == "completed"
     finally:
         srv.shutdown(); state.close()

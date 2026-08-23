@@ -323,6 +323,25 @@ def _dt_or_none(dt: datetime | None) -> datetime | None:
     return dt
 
 
+def asset_timezone_offset(raw) -> int | None:
+    """The local UTC offset (seconds) the asset's own record carries, if any.
+
+    Best-effort: ``timeZoneOffset`` lives on ``PhotoAsset._asset_record``, an
+    implementation detail of pyicloud rather than part of its public surface,
+    so any shape this doesn't expect is treated the same as "not known" —
+    callers fall back to UTC, which is always correct, just not as precise as
+    the camera's own local time would have been.
+    """
+    try:
+        record = getattr(raw, "_asset_record", None)
+        if record is None:
+            return None
+        value = record_field_value(record, "timeZoneOffset")
+        return int(value) if isinstance(value, (int, float)) else None
+    except Exception:  # noqa: BLE001 - best-effort only, never worth failing over
+        return None
+
+
 # --- Service construction & auth primitives (used by auth.py) -----------------
 
 

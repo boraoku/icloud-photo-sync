@@ -21,6 +21,7 @@ from threading import Event
 import requests
 from tqdm import tqdm
 
+from . import metadata as md
 from .config import AppConfig, PARTIAL_FLUSH_BYTES, PARTIAL_FLUSH_SECS
 from .errors import (
     DownloadError,
@@ -28,7 +29,7 @@ from .errors import (
     OperationCancelled,
     TransientError,
 )
-from .icloud_client import ICloudClient
+from .icloud_client import ICloudClient, asset_timezone_offset
 from .logutil import get_logger
 from .models import AssetRef, DownloadOutcome
 from .state import StateStore
@@ -36,6 +37,31 @@ from .state import StateStore
 logger = get_logger(__name__)
 
 _RETRYABLE = (TransientError, IntegrityError, requests.exceptions.RequestException)
+_UNAVAILABLE_LOGGED: set[str] = set()
+"""Which tool-unavailable notices have already been printed this process —
+one clear line per tool, not one per file."""
+
+
+def _stamp_downloaded(abs_dest: Path, asset: AssetRef) -> None:
+    """Best-effort: never let a metadata enrichment failure touch the
+    download's own success/failure outcome — see :mod:`icloud_photo_sync.metadata`.
+    """
+    if asset.capture_dt is None:
+        return
+    outcome = md.ensure_capture_date(
+        abs_dest, asset.capture_dt, tz_offset_seconds=asset_timezone_offset(asset.raw),
+    )
+    if outcome is md.MetadataOutcome.TOOL_UNAVAILABLE:
+        tool = md.required_tool_name(abs_dest) or "the required tool"
+        if tool not in _UNAVAILABLE_LOGGED:
+            _UNAVAILABLE_LOGGED.add(tool)
+            logger.warning(
+                "%s not found — downloaded files missing a capture date will keep "
+                "today's date instead of being stamped (install it to fix this)",
+                tool,
+            )
+    elif outcome is md.MetadataOutcome.FAILED:
+        logger.debug("could not verify/stamp capture date for %s", abs_dest)
 
 
 class Downloader:
@@ -118,6 +144,7 @@ class Downloader:
                         "during the download"
                     )
                 self._finalize(part, abs_dest)
+                _stamp_downloaded(abs_dest, asset)
                 self.state.mark_completed(asset.id, final_size)
                 return DownloadOutcome.DOWNLOADED
 
