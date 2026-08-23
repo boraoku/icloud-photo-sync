@@ -1226,6 +1226,47 @@ class TestRunOptimiseExternal:
         assert placed.exists()
         assert not (config.output_root / name).exists()
 
+    def test_keep_originals_moves_into_originals_folder_preserving_subpath(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path, keep_originals=True)
+        rel = "2020/08/clip.mp4"
+        self._seed_source(config, rel)
+
+        source_probe = make_probe(rel=rel, size=300 * 1024 * 1024, width=3840, height=2160)
+        out = make_probe(rel=rel, size=25 * 1024 * 1024, width=1080, height=1920)
+
+        def probe_fn(p, r):
+            return out if config.work_dir in p.parents else source_probe
+
+        monkeypatch.setattr(op.md, "ensure_capture_date",
+                            lambda *a, **kw: MetadataOutcome.STAMPED)
+
+        code = self._run(
+            config, monkeypatch,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=probe_fn,
+        )
+
+        assert code == 0
+        # The original went to originals/2020/08/clip.mp4, not the Trash --
+        # same subpath it had under output_root, just rooted differently.
+        kept = config.output_root / "originals" / rel
+        assert kept.exists()
+        assert not (config.output_root / rel).exists()
+        # The optimised copy still took the original's place.
+        placed = (config.output_root / rel).with_suffix(".mov")
+        assert placed.exists()
+
+    def test_originals_folder_is_excluded_from_a_later_scan(self, tmp_path, monkeypatch):
+        # Without this, a re-run would find the retired originals sitting in
+        # originals/ and offer to convert them all over again.
+        config = self._config(tmp_path)
+        kept = config.output_root / "originals" / "2020" / "08" / "old.mov"
+        kept.parent.mkdir(parents=True)
+        _sparse(kept, 300 * 1024 * 1024)
+
+        found = op.scan_videos(config.output_root)
+        assert found == []
+
     def test_nothing_worth_optimising_is_a_clean_no_op(self, tmp_path, monkeypatch):
         config = self._config(tmp_path)
         self._seed_source(config, "tiny.mp4", size=1024)  # well under --min-size

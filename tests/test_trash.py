@@ -3,7 +3,7 @@
 import subprocess
 from pathlib import Path
 
-from icloud_photo_sync.trash import _escape, move_to_trash
+from icloud_photo_sync.trash import _escape, move_to_folder, move_to_trash
 
 
 class FakeProc:
@@ -88,3 +88,98 @@ def test_runner_exception_reported(tmp_path):
     results = move_to_trash([p], runner=runner)
     assert results[0].ok is False
     assert p.exists()
+
+
+# --- move_to_folder (video-optimise-external --keep-originals) ---------------
+
+
+def test_move_to_folder_preserves_subpath(tmp_path):
+    source_root = tmp_path / "tree"
+    dest_root = tmp_path / "tree" / "originals"
+    src = source_root / "2020" / "08" / "clip.mov"
+    src.parent.mkdir(parents=True)
+    src.write_text("x")
+
+    results = move_to_folder([src], source_root=source_root, dest_root=dest_root)
+
+    assert results == [type(results[0])(path=src, ok=True, error=None)]
+    assert not src.exists()
+    assert (dest_root / "2020" / "08" / "clip.mov").exists()
+    assert (dest_root / "2020" / "08" / "clip.mov").read_text() == "x"
+
+
+def test_move_to_folder_creates_nested_dirs_as_needed(tmp_path):
+    source_root = tmp_path / "tree"
+    dest_root = tmp_path / "elsewhere" / "originals"
+    src = source_root / "a" / "b" / "c" / "clip.mov"
+    src.parent.mkdir(parents=True)
+    src.write_text("x")
+
+    results = move_to_folder([src], source_root=source_root, dest_root=dest_root)
+
+    assert results[0].ok is True
+    assert (dest_root / "a" / "b" / "c" / "clip.mov").exists()
+
+
+def test_move_to_folder_flat_file_with_no_subpath(tmp_path):
+    source_root = tmp_path / "tree"
+    dest_root = source_root / "originals"
+    source_root.mkdir(parents=True)
+    src = source_root / "clip.mov"
+    src.write_text("x")
+
+    results = move_to_folder([src], source_root=source_root, dest_root=dest_root)
+
+    assert results[0].ok is True
+    assert (dest_root / "clip.mov").exists()
+
+
+def test_move_to_folder_reports_a_path_outside_source_root(tmp_path):
+    source_root = tmp_path / "tree"
+    source_root.mkdir()
+    dest_root = tmp_path / "originals"
+    outside = tmp_path / "elsewhere" / "clip.mov"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("x")
+
+    results = move_to_folder([outside], source_root=source_root, dest_root=dest_root)
+
+    assert results[0].ok is False
+    assert "is not under" in results[0].error
+    assert outside.exists()  # left alone, not silently dropped
+
+
+def test_move_to_folder_refuses_to_clobber_an_existing_destination(tmp_path):
+    source_root = tmp_path / "tree"
+    dest_root = tmp_path / "originals"
+    src = source_root / "2020" / "08" / "clip.mov"
+    src.parent.mkdir(parents=True)
+    src.write_text("new")
+    existing = dest_root / "2020" / "08" / "clip.mov"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("already here")
+
+    results = move_to_folder([src], source_root=source_root, dest_root=dest_root)
+
+    assert results[0].ok is False
+    assert "already exists" in results[0].error
+    assert src.exists()                     # source untouched
+    assert existing.read_text() == "already here"  # destination untouched
+
+
+def test_move_to_folder_one_bad_file_does_not_block_the_rest(tmp_path):
+    source_root = tmp_path / "tree"
+    dest_root = tmp_path / "originals"
+    good = source_root / "2020" / "08" / "good.mov"
+    good.parent.mkdir(parents=True)
+    good.write_text("x")
+    outside = tmp_path / "elsewhere" / "bad.mov"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("x")
+
+    results = move_to_folder([outside, good], source_root=source_root, dest_root=dest_root)
+
+    by_path = {r.path: r for r in results}
+    assert by_path[outside].ok is False
+    assert by_path[good].ok is True
+    assert (dest_root / "2020" / "08" / "good.mov").exists()

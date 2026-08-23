@@ -75,6 +75,13 @@ DEFAULT_OPTIMISE_MIN_FREE = 5 * 1024 * 1024 * 1024   # headroom on the output vo
 # Every scanner excludes it by name (see local_clean.iter_media_files).
 OPTIMISED_DIRNAME = "optimised"
 
+# Where video-optimise-external's --keep-originals puts a trashed original
+# instead of the macOS Trash, preserving its YYYY/MM subpath underneath (e.g.
+# 2020/08/clip.mov -> originals/2020/08/clip.mov). Excluded from scans for the
+# same reason OPTIMISED_DIRNAME is: without that, a re-run would find the
+# moved originals sitting there and offer to convert them all over again.
+ORIGINALS_DIRNAME = "originals"
+
 # The scan envelopes: which files each clean command will even look at. They live
 # here rather than in the clean modules because ``retro_clean`` reasons about
 # them too — "no clean command could have offered this file" is only answerable
@@ -352,6 +359,12 @@ class VideoOptimiseConfig:
     :meth:`icloud_photo_sync.optimise_job.OptimiseJob.retry_colour_mismatch`
     for why this needs an explicit flag rather than happening on every run."""
     restart: bool = False
+
+    keep_originals: bool = False
+    """``video-optimise-external --keep-originals``: instead of the macOS
+    Trash, move a swapped-out original into ``ORIGINALS_DIRNAME`` at the top
+    of the tree, preserving its subpath underneath. Unused by
+    ``video-optimise`` itself, which always uses the Trash."""
 
     port: int = 0
     open_browser: bool = True

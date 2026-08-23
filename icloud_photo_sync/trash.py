@@ -12,6 +12,7 @@ The first Finder-automation call triggers a one-time macOS consent prompt
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,43 @@ def move_to_trash(
             else:
                 # A whole-batch failure hides which file broke it; isolate.
                 results.extend(_retry_individually(batch, runner, stderr))
+    return results
+
+
+def move_to_folder(
+    paths: Sequence[Path], *, source_root: Path, dest_root: Path,
+) -> list[TrashResult]:
+    """Move each of ``paths`` into ``dest_root``, preserving its position
+    relative to ``source_root`` — e.g. ``source_root/2020/08/clip.mov``
+    becomes ``dest_root/2020/08/clip.mov``. The ``video-optimise-external
+    --keep-originals`` alternative to :func:`move_to_trash`: same per-file
+    :class:`TrashResult` shape, so a caller can pass either interchangeably.
+
+    A destination that already exists, or a source not actually under
+    ``source_root``, is reported as a per-file failure rather than raised —
+    matching :func:`move_to_trash`'s contract that one bad file never aborts
+    the rest of the batch.
+    """
+    results: list[TrashResult] = []
+    for p in paths:
+        try:
+            rel = p.relative_to(source_root)
+        except ValueError:
+            results.append(TrashResult(path=p, ok=False,
+                                       error=f"{p} is not under {source_root}"))
+            continue
+        dest = dest_root / rel
+        if dest.exists():
+            results.append(TrashResult(path=p, ok=False,
+                                       error=f"{dest} already exists"))
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(dest))
+        except OSError as exc:
+            results.append(TrashResult(path=p, ok=False, error=str(exc)))
+            continue
+        results.append(TrashResult(path=p, ok=True))
     return results
 
 

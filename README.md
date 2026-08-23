@@ -122,7 +122,7 @@ icloud-photo-sync [GLOBAL] video-optimise-external [--min-size SIZE] [--short-si
                                        [--max-fps N] [--hdr-bitrate RATE] [--sdr-bitrate RATE]
                                        [--skip-hdr] [--hdr-only] [--limit N] [--restart]
                                        [--retry-colour-mismatch] [--dry-run]
-                                       [--port N] [--no-browser]
+                                       [--keep-originals] [--port N] [--no-browser]
 icloud-photo-sync [GLOBAL] photo-optimise-external [--max-size SIZE] [--lm-url URL]
                                        [--lm-model NAME] [--flag CATS] [--limit N]
                                        [--reclassify] [--no-browser] [--dry-run]
@@ -450,6 +450,12 @@ with the conversions it offers to move the **originals** straight to the
 Trash and puts the optimised files in their place, same folder, same names.
 Takes the same flags as `video-optimise` except `--offline`/`--reconcile-only`
 (meaningless here — it's always offline, and there's no upload to reconcile).
+
+**`--keep-originals`** moves the originals into an `originals/` folder at the
+top of the tree instead of the Trash, preserving each file's subfolder
+underneath — `2020/08/clip.mov` becomes `originals/2020/08/clip.mov`. That
+folder is excluded from every later scan, the same way `optimised/` is, so
+the retired originals are never offered back for re-conversion.
 
 ### `photo-optimise-external`
 

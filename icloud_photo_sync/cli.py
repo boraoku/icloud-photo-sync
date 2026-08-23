@@ -688,6 +688,11 @@ def video_optimise_external(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Plan and print the exact ffmpeg command per file. Change nothing."
     ),
+    keep_originals: bool = typer.Option(
+        False, "--keep-originals",
+        help="Move originals into an originals/ folder (same YYYY/MM subpath) "
+             "instead of the Trash.",
+    ),
     port: int = typer.Option(0, "--port", help="Review server port (0 = auto)."),
     no_browser: bool = typer.Option(
         False, "--no-browser", help="Print the review URL instead of opening a browser."
@@ -698,8 +703,9 @@ def video_optimise_external(
     For a folder that isn't under this tool's active iCloud management — an
     old export, a backup drive, anything you already have on disk. Converts
     exactly like `video-optimise`, then offers to move the originals straight
-    to the Trash and put the optimised copies in their place. No sign-in, no
-    upload, no iCloud delete of any kind.
+    to the Trash (or, with --keep-originals, into an originals/ folder at the
+    top of the tree instead) and put the optimised copies in their place. No
+    sign-in, no upload, no iCloud delete of any kind.
 
     A video with no capture date of its own gets one worked out from the file
     itself, its filename (WhatsApp and common camera conventions), or — last
@@ -724,6 +730,7 @@ def video_optimise_external(
             restart=restart or None,
             retry_colour_mismatch=retry_colour_mismatch or None,
             dry_run=dry_run or None,
+            keep_originals=keep_originals or None,
             port=port,
             open_browser=not no_browser,
             verbose=octx.verbose,

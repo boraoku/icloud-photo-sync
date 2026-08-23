@@ -51,6 +51,7 @@ from . import video_optimise as vo
 from .auth import SessionManager
 from .clean_icloud import RECOVERY_DAYS, ArmedICloud, SURE_PHRASE, _normalise, arm
 from .config import (
+    ORIGINALS_DIRNAME,
     OPTIMISED_DIRNAME,
     VIDEO_SUFFIXES,
     ICloudDeleteConfig,
@@ -62,7 +63,7 @@ from .logutil import get_logger
 from .models import AssetRef
 from .poster import PosterCache, probe_durations
 from .state import StateStore
-from .trash import move_to_trash
+from .trash import move_to_folder, move_to_trash
 from .video_optimise import human_size as _size
 
 logger = get_logger(__name__)
@@ -72,9 +73,10 @@ ARM_NOTE_OPTIMISE = (
     "read back — and then only after you type a confirmation here."
 )
 
-_EXCLUDE = frozenset({OPTIMISED_DIRNAME})
-"""The hand-off folder is library-adjacent, not library content: without this
-the scan would offer this command's own output back to it for re-conversion."""
+_EXCLUDE = frozenset({OPTIMISED_DIRNAME, ORIGINALS_DIRNAME})
+"""Both folders are library-adjacent, not library content: without this the
+scan would offer this command's own output (optimised/) or its own retired
+originals (originals/, from --keep-originals) back to it for re-conversion."""
 
 PROBE_WORKERS = 8
 """ffprobe processes in flight while scanning."""
@@ -799,14 +801,22 @@ def _cleanup_locals(
     job: oj.OptimiseJob, config: VideoOptimiseConfig, *, echo,
     state_db: Path | None = None, status: str = oj.STATUS_SWAPPED,
     confirm: Callable[[str], bool] = typer.confirm, trash_fn=move_to_trash,
+    destination_label: str = "the Trash",
 ) -> int:
-    """Offer to Trash the originals of eligible videos, then move the copies in.
+    """Offer to move the originals of eligible videos aside, then move the
+    copies in.
 
     Only rows in ``status`` that have not already been cleaned up are
-    eligible, and they go to the Trash rather than being unlinked: a swap that
-    turns out to have been a mistake stays recoverable for as long as the
-    Trash holds. Defaults to ``swapped`` (``video-optimise``'s own meaning:
-    verified uploaded AND verified deleted from iCloud); ``video-optimise-
+    eligible. Where they go is ``trash_fn``'s decision, not this function's —
+    the macOS Trash by default (a swap that turns out to have been a mistake
+    stays recoverable for as long as the Trash holds), or, for
+    ``video-optimise-external --keep-originals``,
+    :func:`icloud_photo_sync.trash.move_to_folder` into
+    :data:`icloud_photo_sync.config.ORIGINALS_DIRNAME` instead.
+    ``destination_label`` only changes what the confirmation prompt and the
+    result line say, to match whichever ``trash_fn`` was actually given.
+    Defaults to ``swapped`` (``video-optimise``'s own meaning: verified
+    uploaded AND verified deleted from iCloud); ``video-optimise-
     external`` passes ``STATUS_CONVERTED`` instead, since it has no iCloud
     phase to produce ``swapped`` at all — see
     :meth:`icloud_photo_sync.optimise_job.OptimiseJob.needs_local_cleanup`.
@@ -844,7 +854,7 @@ def _cleanup_locals(
 
     total = sum(path.stat().st_size for _, path in live)
     echo("")
-    if not confirm(f"Move the {len(live)} local original(s) to the Trash? "
+    if not confirm(f"Move the {len(live)} local original(s) to {destination_label}? "
                    f"({_size(total)})"):
         echo(f"Kept. The optimised copies are in {config.work_dir}.",
              fg=typer.colors.YELLOW)
@@ -853,7 +863,7 @@ def _cleanup_locals(
     results = trash_fn([path for _, path in live])
     moved = {r.path for r in results if r.ok}
     failed = [r for r in results if not r.ok]
-    echo(f"  ✓ {len(moved)} moved to the Trash.", fg=typer.colors.GREEN)
+    echo(f"  ✓ {len(moved)} moved to {destination_label}.", fg=typer.colors.GREEN)
     for result in failed:
         echo(f"  ✗ {result.path}: {result.error}", fg=typer.colors.RED, err=True)
 
@@ -1126,7 +1136,7 @@ def run_optimise_external(
     convert_fn=tc.convert,
     trash_fn=move_to_trash,
 ) -> int:
-    """Scan → select → convert → review → Trash the originals in place.
+    """Scan → select → convert → review → clear the originals out of the way.
 
     The local half of :func:`run_optimise`, with no iCloud step at all: no
     Apple ID is ever resolved, nothing is uploaded, nothing is deleted from
@@ -1135,6 +1145,12 @@ def run_optimise_external(
     :func:`icloud_photo_sync.metadata.infer_capture_date` — rather than the
     sync-manifest lookup ``video-optimise`` uses, which has nothing to consult
     here.
+
+    ``config.keep_originals`` decides where a swapped-out original goes:
+    the macOS Trash by default (``trash_fn``, injectable for testing), or —
+    with ``--keep-originals`` — :data:`~icloud_photo_sync.config.
+    ORIGINALS_DIRNAME` at the top of the tree, preserving each file's
+    ``YYYY/MM`` subpath underneath.
     """
     problem = _preflight(config, echo)
     if problem:
@@ -1183,8 +1199,17 @@ def run_optimise_external(
             return 0
 
         def finish(job: oj.OptimiseJob, config: VideoOptimiseConfig) -> None:
+            if config.keep_originals:
+                originals_dir = config.output_root / ORIGINALS_DIRNAME
+                mover = lambda paths: move_to_folder(       # noqa: E731
+                    paths, source_root=config.output_root, dest_root=originals_dir)
+                label = f"{ORIGINALS_DIRNAME}/ (keeping each file's subfolder)"
+            else:
+                mover = trash_fn
+                label = "the Trash"
             _cleanup_locals(job, config, echo=echo, confirm=confirm,
-                            trash_fn=trash_fn, status=oj.STATUS_CONVERTED)
+                            trash_fn=mover, status=oj.STATUS_CONVERTED,
+                            destination_label=label)
 
         if not plan.candidates:
             # Nothing NEW to convert this run — but an earlier run may have
