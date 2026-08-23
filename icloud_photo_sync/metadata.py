@@ -37,11 +37,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .logutil import get_logger
 
@@ -57,9 +58,9 @@ EXIFTOOL_TIMEOUT = 30.0
 # is scoped to local-clean's junk-image scan (.jpg/.jpeg/.png only, ≤1 MiB) and
 # changing its meaning would be a surprise to a different feature. HEIC is the
 # format iCloud actually hands back for photos, so it has to be here.
-_VIDEO_SUFFIXES = {".mov", ".mp4", ".m4v", ".avi", ".mpg", ".mpeg", ".3gp", ".3g2",
-                   ".wmv", ".webm", ".mkv", ".mts", ".m2ts"}
-_IMAGE_SUFFIXES = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".tiff", ".tif"}
+VIDEO_SUFFIXES = {".mov", ".mp4", ".m4v", ".avi", ".mpg", ".mpeg", ".3gp", ".3g2",
+                  ".wmv", ".webm", ".mkv", ".mts", ".m2ts"}
+IMAGE_SUFFIXES = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".tiff", ".tif"}
 
 _tool_cache: dict[str, bool] = {}
 """Memoised availability checks — shells out, so ask once per process."""
@@ -94,9 +95,9 @@ def required_tool_name(path: Path) -> str | None:
     for a caller building a one-time "please install X" notice. ``None`` for
     an unsupported suffix, where no tool would be consulted at all."""
     suffix = path.suffix.lower()
-    if suffix in _VIDEO_SUFFIXES:
+    if suffix in VIDEO_SUFFIXES:
         return "ffmpeg/ffprobe"
-    if suffix in _IMAGE_SUFFIXES:
+    if suffix in IMAGE_SUFFIXES:
         return "exiftool"
     return None
 
@@ -133,13 +134,12 @@ def _exif_stamp(dt: datetime, tz_offset_seconds: int | None) -> str:
 # --- video -----------------------------------------------------------------------
 
 
-def _video_has_date(path: Path) -> bool | None:
-    """Does the container already carry a capture date? ``None`` = couldn't tell.
+def _video_date_tags(path: Path) -> dict | None:
+    """The two date tags ffprobe can see, or ``None`` if it couldn't tell.
 
-    Checking both tags: a file could plausibly carry one and not the other, and
-    treating a ``None`` read as "absent" would risk overwriting a date this
-    function simply failed to see — the read-before-write discipline this
-    module exists to honour.
+    Shared by :func:`_video_has_date` (does either exist?) and
+    :func:`_read_video_embedded_date` (what does one actually say?) — one
+    subprocess call, two questions.
     """
     try:
         proc = subprocess.run(
@@ -155,10 +155,45 @@ def _video_has_date(path: Path) -> bool | None:
         logger.debug("ffprobe exited %d reading %s", proc.returncode, path)
         return None
     try:
-        tags = (json.loads(proc.stdout).get("format") or {}).get("tags") or {}
+        return (json.loads(proc.stdout).get("format") or {}).get("tags") or {}
     except (ValueError, TypeError):
         return None
+
+
+def _video_has_date(path: Path) -> bool | None:
+    """Does the container already carry a capture date? ``None`` = couldn't tell.
+
+    Checking both tags: a file could plausibly carry one and not the other, and
+    treating a ``None`` read as "absent" would risk overwriting a date this
+    function simply failed to see — the read-before-write discipline this
+    module exists to honour.
+    """
+    tags = _video_date_tags(path)
+    if tags is None:
+        return None
     return bool(tags.get("creation_time")) or bool(tags.get("com.apple.quicktime.creationdate"))
+
+
+def _read_video_embedded_date(path: Path) -> datetime | None:
+    """The actual value of whichever date tag is present, parsed — not just
+    whether one exists. ``creation_time`` is preferred: it's UTC and
+    unambiguous, where the QuickTime tag's offset still has to be trusted."""
+    tags = _video_date_tags(path)
+    if not tags:
+        return None
+    creation = tags.get("creation_time")
+    if creation:
+        try:
+            return datetime.strptime(creation, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    quicktime = tags.get("com.apple.quicktime.creationdate")
+    if quicktime:
+        try:
+            return datetime.strptime(quicktime, "%Y-%m-%dT%H:%M:%S%z")
+        except ValueError:
+            pass
+    return None
 
 
 def _stamp_video(path: Path, dt: datetime, tz_offset_seconds: int | None) -> bool:
@@ -196,7 +231,10 @@ def _stamp_video(path: Path, dt: datetime, tz_offset_seconds: int | None) -> boo
 # --- image -------------------------------------------------------------------
 
 
-def _image_has_date(path: Path) -> bool | None:
+def _image_date_lines(path: Path) -> list[str] | None:
+    """The two date tags' raw text, one per line (blank = absent), or ``None``
+    if exiftool couldn't be asked. Shared by :func:`_image_has_date` and
+    :func:`_read_image_embedded_date`."""
     try:
         proc = subprocess.run(
             ["exiftool", "-s3", "-DateTimeOriginal", "-CreateDate", str(path)],
@@ -209,7 +247,32 @@ def _image_has_date(path: Path) -> bool | None:
         logger.debug("exiftool exited %d reading %s", proc.returncode, path)
         return None
     # -s3 prints one value per line, blank for a tag that is not present.
-    return any(line.strip() for line in proc.stdout.splitlines())
+    return proc.stdout.splitlines()
+
+
+def _image_has_date(path: Path) -> bool | None:
+    lines = _image_date_lines(path)
+    if lines is None:
+        return None
+    return any(line.strip() for line in lines)
+
+
+def _read_image_embedded_date(path: Path) -> datetime | None:
+    """The actual value of whichever date tag is present, parsed. EXIF has no
+    offset field, so this is read back as a naive local wall-clock time and
+    treated as UTC — the same assumption :func:`_exif_stamp` makes on write."""
+    lines = _image_date_lines(path)
+    if not lines:
+        return None
+    for line in lines:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            return datetime.strptime(text, "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def _stamp_image(path: Path, dt: datetime, tz_offset_seconds: int | None) -> bool:
@@ -280,7 +343,7 @@ def _ensure_embedded_date(
     path: Path, capture_dt: datetime, tz_offset_seconds: int | None,
 ) -> MetadataOutcome:
     suffix = path.suffix.lower()
-    if suffix in _VIDEO_SUFFIXES:
+    if suffix in VIDEO_SUFFIXES:
         if not ffmpeg_pair_available():
             return MetadataOutcome.TOOL_UNAVAILABLE
         has = _video_has_date(path)
@@ -291,7 +354,7 @@ def _ensure_embedded_date(
         return (MetadataOutcome.STAMPED if _stamp_video(path, capture_dt, tz_offset_seconds)
                 else MetadataOutcome.FAILED)
 
-    if suffix in _IMAGE_SUFFIXES:
+    if suffix in IMAGE_SUFFIXES:
         if not exiftool_available():
             return MetadataOutcome.TOOL_UNAVAILABLE
         has = _image_has_date(path)
@@ -303,3 +366,112 @@ def _ensure_embedded_date(
                 else MetadataOutcome.FAILED)
 
     return MetadataOutcome.UNSUPPORTED_TYPE
+
+
+# --- inferring a date with no manifest at all -------------------------------
+#
+# ``ensure_capture_date`` above assumes the caller already knows the true
+# capture date (from iCloud, or from the sync manifest). The two
+# ``*-external`` commands have neither — a folder of files that may never
+# have passed through this tool's own download at all — so this is a second,
+# independent ladder for finding a date worth trying, used only when nothing
+# authoritative is available. Every rung here is a *guess in decreasing order
+# of confidence*, not a lookup, which is why the last one is deliberately
+# coarse (the middle of a month) rather than silently inventing a day.
+
+CaptureDateSource = str
+"""One of ``"embedded"``, ``"filename"``, ``"folder"`` or ``"unknown"`` — which
+rung of :func:`infer_capture_date` answered, for a caller that wants to report
+what it did rather than just act on it."""
+
+SOURCE_EMBEDDED: CaptureDateSource = "embedded"
+SOURCE_FILENAME: CaptureDateSource = "filename"
+SOURCE_FOLDER: CaptureDateSource = "folder"
+SOURCE_UNKNOWN: CaptureDateSource = "unknown"
+
+
+def read_embedded_capture_date(path: Path) -> datetime | None:
+    """The file's own embedded capture date, parsed — or ``None`` if it has
+    none, the type is unsupported, or the read failed. Dispatches by suffix
+    exactly like :func:`_ensure_embedded_date`, but returns the real value
+    instead of a presence check: the first, most-trusted rung of
+    :func:`infer_capture_date`."""
+    suffix = path.suffix.lower()
+    if suffix in VIDEO_SUFFIXES:
+        return _read_video_embedded_date(path)
+    if suffix in IMAGE_SUFFIXES:
+        return _read_image_embedded_date(path)
+    return None
+
+
+# WhatsApp's own naming: IMG-20191025-WA0007.jpg, VID-20191025-WA0003.mp4 —
+# a date with no time. Matched by the "-WA<digits>" suffix, not the IMG-/VID-
+# prefix, since that suffix is the actually-distinctive signal.
+_WA_DATE_RE = re.compile(r"(\d{4})(\d{2})(\d{2})-WA\d+", re.IGNORECASE)
+
+# Generic camera/phone timestamp naming: IMG_20191025_150712.jpg,
+# VID_20191025_150712.mp4, or a bare 20191025_150712.mp4 — date AND time.
+# Deliberately narrow (an underscore-separated 8-digit/6-digit pair) rather
+# than "any 8 digits that happen to parse as a date": a serial number or a
+# resolution tag could coincidentally validate as a date, and this module's
+# whole discipline is to guess only when the shape is actually recognisable.
+_CAMERA_DATETIME_RE = re.compile(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})")
+
+
+def infer_capture_date_from_name(name: str) -> datetime | None:
+    """A date guessed from a filename WhatsApp or a camera app produced.
+
+    The datetime pattern is tried first — when it matches, it's strictly more
+    informative than the date-only one. Either way an invalid calendar date
+    (month 13, day 32) is rejected via the same construction that would
+    reject it anywhere else, not specially detected.
+    """
+    m = _CAMERA_DATETIME_RE.search(name)
+    if m:
+        try:
+            return datetime(*(int(g) for g in m.groups()), tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    m = _WA_DATE_RE.search(name)
+    if m:
+        try:
+            year, month, day = (int(g) for g in m.groups())
+            return datetime(year, month, day, 12, 0, 0, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+_YEAR_RE = re.compile(r"^(19|20)\d{2}$")
+_MONTH_RE = re.compile(r"^(0[1-9]|1[0-2])$")
+
+
+def infer_capture_date_from_path(rel: str) -> datetime | None:
+    """A date guessed from a ``YYYY/MM`` folder — this tool's own ``sync``
+    layout. The 15th at noon UTC: the middle of the only interval actually
+    known, so no single guessed instant is more wrong than any other."""
+    parts = PurePosixPath(rel).parts
+    if len(parts) < 2:
+        return None
+    year, month = parts[0], parts[1]
+    if not _YEAR_RE.match(year) or not _MONTH_RE.match(month):
+        return None
+    return datetime(int(year), int(month), 15, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def infer_capture_date(path: Path, rel: str) -> tuple[datetime | None, CaptureDateSource]:
+    """The full ladder for a file with no authoritative date on hand: the
+    file's own embedded metadata, then its filename, then (last resort) the
+    ``YYYY/MM`` folder it's sitting in. ``(None, SOURCE_UNKNOWN)`` when
+    nothing answers — never a guess where no signal exists at all.
+    """
+    embedded = read_embedded_capture_date(path)
+    if embedded is not None:
+        return embedded, SOURCE_EMBEDDED
+    from_name = infer_capture_date_from_name(path.name)
+    if from_name is not None:
+        return from_name, SOURCE_FILENAME
+    from_path = infer_capture_date_from_path(rel)
+    if from_path is not None:
+        return from_path, SOURCE_FOLDER
+    return None, SOURCE_UNKNOWN

@@ -30,7 +30,8 @@ from .config import (
 )
 from .downloader import Downloader
 from .local_clean import run_local_clean, _parse_size
-from .optimise import run_optimise
+from .photo_optimise_external import run_photo_optimise_external
+from .optimise import run_optimise, run_optimise_external
 from .video_clean import run_video_clean
 from .errors import (
     AccountPreconditionError,
@@ -437,6 +438,76 @@ def local_clean(
     _run_guarded(lambda: run_local_clean(config, icloud))
 
 
+@app.command("photo-optimise-external")
+def photo_optimise_external(
+    ctx: typer.Context,
+    max_size: str = typer.Option(
+        "1MB", "--max-size",
+        help="Phase B (local-clean): only images at or below this size (e.g. 500KB, 2MB).",
+    ),
+    lm_url: str = typer.Option(
+        cfg.DEFAULT_LM_BASE_URL, "--lm-url", envvar=cfg.ENV_LM_URL,
+        help="Phase B: local vision-model base URL (LM Studio, OpenAI-compatible).",
+    ),
+    lm_model: str = typer.Option(
+        cfg.DEFAULT_LM_MODEL, "--lm-model", help="Phase B: vision model name."
+    ),
+    flag: str = typer.Option(
+        ",".join(cfg.DEFAULT_FLAG_CATEGORIES), "--flag",
+        help="Phase B: comma-separated categories to flag for deletion "
+             f"(any of: {', '.join(CATEGORIES)}).",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Phase B: classify at most N new images this run (resume later)."
+    ),
+    port: int = typer.Option(0, "--port", help="Phase B: review server port (0 = auto)."),
+    reclassify: bool = typer.Option(
+        False, "--reclassify", help="Phase B: ignore the classification cache and redo everything."
+    ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the review URL instead of opening a browser."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Phase A only: report which photos would get a date, stamp nothing, "
+             "and skip Phase B entirely.",
+    ),
+) -> None:
+    """Recover missing photo dates, then find small screenshots/memes and review them.
+
+    No iCloud contact of any kind — no sign-in, no upload, no delete. Phase A
+    checks every photo in the folder (not just small ones) for a missing
+    capture date and stamps one in from the file itself, its filename, or —
+    last resort — the YYYY/MM folder it's in. An existing date is never
+    overwritten. Phase B is the existing `local-clean` flow, unchanged: scan
+    for small screenshots/memes, review them in a browser, move to Trash.
+    """
+    octx: AppContext = ctx.obj
+    output_root = _output_root(octx)
+
+    flag_categories = tuple(c.strip() for c in flag.split(",") if c.strip())
+    bad = [c for c in flag_categories if c not in CATEGORIES]
+    if bad:
+        raise typer.BadParameter(
+            f"unknown --flag categories {bad}; choose from {', '.join(CATEGORIES)}"
+        )
+
+    config = LocalCleanConfig.create(
+        output_root,
+        max_bytes=_parse_size(max_size),
+        lm_base_url=lm_url,
+        lm_model=lm_model,
+        flag_categories=flag_categories,
+        limit=limit,
+        port=port,
+        reclassify=reclassify,
+        open_browser=not no_browser,
+        verbose=octx.verbose,
+    )
+    setup_logging(config.logs_dir, config.verbose)
+    _run_guarded(lambda: run_photo_optimise_external(config, dry_run=dry_run))
+
+
 @app.command("video-clean")
 def video_clean(
     ctx: typer.Context,
@@ -575,6 +646,95 @@ def video_optimise(
     cancel = Event()
     _install_signal_handlers(cancel)
     _run_guarded(lambda: run_optimise(config, icloud, progress=tqdm, cancel=cancel))
+
+
+@app.command("video-optimise-external")
+def video_optimise_external(
+    ctx: typer.Context,
+    min_size: str = typer.Option(
+        "20MB", "--min-size",
+        help="Only consider videos at or above this size (20MB covers ~90% of video bytes).",
+    ),
+    short_side: int = typer.Option(
+        cfg.DEFAULT_OPTIMISE_SHORT_SIDE, "--short-side",
+        help="Cap the SHORTER side at this many pixels (1080 = 'HD', portrait-safe).",
+    ),
+    max_fps: float = typer.Option(
+        cfg.DEFAULT_OPTIMISE_MAX_FPS, "--max-fps",
+        help="Frame-rate cap. Never applied to slow motion, which keeps its rate.",
+    ),
+    hdr_bitrate: str = typer.Option(
+        "8M", "--hdr-bitrate", help="Target bitrate for HDR/10-bit sources at 1080p."
+    ),
+    sdr_bitrate: str = typer.Option(
+        "6M", "--sdr-bitrate", help="Target bitrate for 8-bit sources at 1080p."
+    ),
+    skip_hdr: bool = typer.Option(
+        False, "--skip-hdr", help="Leave HDR clips alone entirely."
+    ),
+    hdr_only: bool = typer.Option(
+        False, "--hdr-only", help="Only convert HDR clips (where most of the space is)."
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Convert at most N videos this run; re-run for the rest."
+    ),
+    restart: bool = typer.Option(
+        False, "--restart", help="Throw away the unfinished job and start over."
+    ),
+    retry_colour_mismatch: bool = typer.Option(
+        False, "--retry-colour-mismatch",
+        help="Give videos that failed the colour check one more attempt this run.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Plan and print the exact ffmpeg command per file. Change nothing."
+    ),
+    port: int = typer.Option(0, "--port", help="Review server port (0 = auto)."),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the review URL instead of opening a browser."
+    ),
+) -> None:
+    """Re-encode oversized videos in place, no iCloud involved at all.
+
+    For a folder that isn't under this tool's active iCloud management — an
+    old export, a backup drive, anything you already have on disk. Converts
+    exactly like `video-optimise`, then offers to move the originals straight
+    to the Trash and put the optimised copies in their place. No sign-in, no
+    upload, no iCloud delete of any kind.
+
+    A video with no capture date of its own gets one worked out from the file
+    itself, its filename (WhatsApp and common camera conventions), or — last
+    resort — the YYYY/MM folder it's sitting in, assigned the 15th at noon.
+    An existing date is never overwritten.
+    """
+    octx: AppContext = ctx.obj
+    output_root = _output_root(octx)
+
+    try:
+        config = cfg.VideoOptimiseConfig.create(
+            output_root,
+            db_prefix="video-optimise-external",
+            min_bytes=_parse_size(min_size),
+            short_side=short_side,
+            max_fps=max_fps,
+            hdr_bitrate=_parse_bitrate(hdr_bitrate),
+            sdr_bitrate=_parse_bitrate(sdr_bitrate),
+            skip_hdr=skip_hdr or None,
+            hdr_only=hdr_only or None,
+            limit=limit,
+            restart=restart or None,
+            retry_colour_mismatch=retry_colour_mismatch or None,
+            dry_run=dry_run or None,
+            port=port,
+            open_browser=not no_browser,
+            verbose=octx.verbose,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    setup_logging(config.logs_dir, config.verbose)
+    cancel = Event()
+    _install_signal_handlers(cancel)
+    _run_guarded(lambda: run_optimise_external(config, progress=tqdm, cancel=cancel))
 
 
 @app.command("icloud-delete")

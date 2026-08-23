@@ -517,15 +517,23 @@ class OptimiseJob:
             "ORDER BY src_bytes DESC"
         ).fetchall()
 
-    def needs_local_cleanup(self) -> list[sqlite3.Row]:
-        """Swapped rows whose local side has not been finished yet.
+    def needs_local_cleanup(self, status: str = STATUS_SWAPPED) -> list[sqlite3.Row]:
+        """Rows in ``status`` whose local side has not been finished yet.
 
         The cleanup is offered from here rather than from :meth:`swapped` so it
-        is asked once per video, ever.
+        is asked once per video, ever. Defaults to ``swapped`` — verified
+        uploaded AND verified deleted from iCloud — which is what
+        ``video-optimise`` itself always means by "ready for local cleanup".
+        ``video-optimise-external`` has no iCloud phase to produce that status
+        at all, so it passes ``STATUS_CONVERTED`` instead: there, "the output
+        already passed the colour/size gate and survived the reject screen" is
+        the whole safety bar, since nothing is ever waiting on a cloud
+        round-trip.
         """
         return self._conn.execute(
-            "SELECT * FROM jobs WHERE status = 'swapped' AND local_done IS NULL "
-            "ORDER BY updated_at"
+            "SELECT * FROM jobs WHERE status = ? AND local_done IS NULL "
+            "ORDER BY updated_at",
+            (status,),
         ).fetchall()
 
     def mark_local_done(self, rel: str) -> None:

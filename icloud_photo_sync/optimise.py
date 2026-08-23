@@ -254,6 +254,7 @@ def _convert_all(
     convert_fn=tc.convert,
     probe_fn=tc.probe,
     state_db: Path | None = None,
+    infer_date_fn: Callable[[Path, str], datetime | None] | None = None,
 ) -> Totals:
     """Encode every ``selected`` row, verifying colour and size on the output.
 
@@ -362,7 +363,7 @@ def _convert_all(
                     bar.update(1)
                 continue
 
-            _stamp_converted(dest, row["asset_id"], manifest)
+            _stamp_converted(dest, row, src, manifest, infer_date_fn)
 
             job.mark_converted(rel, out_rel=name, out_bytes=result.size,
                                out_probe=_probe_dict(output))
@@ -381,22 +382,34 @@ def _convert_all(
     return totals
 
 
-def _stamp_converted(dest: Path, asset_id: str | None, manifest: StateStore | None) -> None:
-    """Best-effort: give the converted file the source's true capture date
-    when the manifest still knows it and the file doesn't carry one — see
-    :mod:`icloud_photo_sync.metadata`. A no-op offline, for a row the manifest
-    never saw, or once asset-id backfill hasn't reached this row yet.
+def _stamp_converted(
+    dest: Path, row, src: Path, manifest: StateStore | None,
+    infer_date_fn: Callable[[Path, str], datetime | None] | None,
+) -> None:
+    """Best-effort: give the converted file the source's true capture date —
+    see :mod:`icloud_photo_sync.metadata`.
+
+    Two independent sources, tried in order, matching the two callers:
+    ``video-optimise`` has a sync manifest and knows the asset id, so the
+    manifest's own recorded ``capture_dt`` is authoritative when present.
+    ``video-optimise-external`` has neither — ``manifest`` is always ``None``
+    there — so ``infer_date_fn`` (the filename/folder ladder in
+    :func:`icloud_photo_sync.metadata.infer_capture_date`) is what it passes
+    instead. A no-op if neither source answers.
     """
-    if manifest is None or not asset_id:
-        return
-    state_row = manifest.get(asset_id)
-    if state_row is None or not state_row["capture_dt"]:
-        return
-    try:
-        capture_dt = datetime.fromisoformat(state_row["capture_dt"])
-    except ValueError:
-        return
-    md.ensure_capture_date(dest, capture_dt)
+    capture_dt = None
+    asset_id = row["asset_id"]
+    if manifest is not None and asset_id:
+        state_row = manifest.get(asset_id)
+        if state_row is not None and state_row["capture_dt"]:
+            try:
+                capture_dt = datetime.fromisoformat(state_row["capture_dt"])
+            except ValueError:
+                capture_dt = None
+    if capture_dt is None and infer_date_fn is not None:
+        capture_dt = infer_date_fn(src, row["rel"])
+    if capture_dt is not None:
+        md.ensure_capture_date(dest, capture_dt)
 
 
 def _colour_arrow(source: vo.VideoProbe, output: vo.VideoProbe) -> str:
@@ -784,14 +797,19 @@ def _reconcile_and_delete(
 
 def _cleanup_locals(
     job: oj.OptimiseJob, config: VideoOptimiseConfig, *, echo,
-    state_db: Path | None = None,
+    state_db: Path | None = None, status: str = oj.STATUS_SWAPPED,
     confirm: Callable[[str], bool] = typer.confirm, trash_fn=move_to_trash,
 ) -> int:
-    """Offer to Trash the originals of swapped videos, then move the copies in.
+    """Offer to Trash the originals of eligible videos, then move the copies in.
 
-    Only ``swapped`` rows that have not already been cleaned up are eligible,
-    and they go to the Trash rather than being unlinked: a swap that turns out
-    to have been a mistake stays recoverable for as long as the Trash holds.
+    Only rows in ``status`` that have not already been cleaned up are
+    eligible, and they go to the Trash rather than being unlinked: a swap that
+    turns out to have been a mistake stays recoverable for as long as the
+    Trash holds. Defaults to ``swapped`` (``video-optimise``'s own meaning:
+    verified uploaded AND verified deleted from iCloud); ``video-optimise-
+    external`` passes ``STATUS_CONVERTED`` instead, since it has no iCloud
+    phase to produce ``swapped`` at all — see
+    :meth:`icloud_photo_sync.optimise_job.OptimiseJob.needs_local_cleanup`.
 
     Two guards, because getting this wrong destroys the *replacement* rather
     than the original. ``needs_local_cleanup`` asks the question once per video
@@ -802,7 +820,7 @@ def _cleanup_locals(
     answered by ``exists()``, and a run that asked again would trash the
     optimised file it had just put there.
     """
-    rows = job.needs_local_cleanup()
+    rows = job.needs_local_cleanup(status)
     live: list = []
     puzzling: list = []
     for row in rows:
@@ -1086,6 +1104,108 @@ def run_optimise(
     return code or (1 if totals.failed else 0)
 
 
+def _infer_date_for_video(src: Path, rel: str) -> datetime | None:
+    """``_convert_all``'s ``infer_date_fn`` for ``video-optimise-external``:
+    the source's own metadata/filename/folder ladder, source label discarded
+    — there's no per-file report to attribute it to, unlike the photo command.
+    """
+    dt, _source = md.infer_capture_date(src, rel)
+    return dt
+
+
+def run_optimise_external(
+    config: VideoOptimiseConfig,
+    *,
+    echo=typer.secho,
+    progress=None,
+    confirm: Callable[..., bool] = typer.confirm,
+    choose=orv.choose_videos,
+    compare=orv.compare_results,
+    cancel: Event | None = None,
+    probe_fn=tc.probe,
+    convert_fn=tc.convert,
+    trash_fn=move_to_trash,
+) -> int:
+    """Scan → select → convert → review → Trash the originals in place.
+
+    The local half of :func:`run_optimise`, with no iCloud step at all: no
+    Apple ID is ever resolved, nothing is uploaded, nothing is deleted from
+    iCloud. A video with no capture date gets one inferred from the source
+    file itself, its filename, or (last resort) its ``YYYY/MM`` folder — see
+    :func:`icloud_photo_sync.metadata.infer_capture_date` — rather than the
+    sync-manifest lookup ``video-optimise`` uses, which has nothing to consult
+    here.
+    """
+    problem = _preflight(config, echo)
+    if problem:
+        echo(problem, fg=typer.colors.RED, err=True)
+        return 2
+
+    root = config.output_root
+
+    with oj.OptimiseJob(config.job_db) as job:
+        if not config.dry_run:
+            if config.restart:
+                job.clear()
+            if config.retry_colour_mismatch:
+                retried = job.retry_colour_mismatch()
+                if retried:
+                    echo(f"--retry-colour-mismatch: giving {retried} video(s) "
+                         "another attempt.", fg=typer.colors.BLUE)
+
+        echo(f"\nScanning {root} for videos…", fg=typer.colors.BLUE)
+        videos = scan_videos(root)
+        if not videos:
+            echo("No videos found.", fg=typer.colors.GREEN)
+            return 0
+
+        probes = probe_all(videos, probe_fn=probe_fn, progress=progress,
+                           cancel=cancel)
+        if cancel is not None and cancel.is_set():
+            return 130
+        plan = vo.build_plan(
+            probes, rels=[rel for _, rel, _ in videos],
+            image_stems=image_stems(root),
+            min_bytes=config.min_bytes, short_side=config.short_side,
+            max_fps=config.max_fps, hdr_bitrate=config.hdr_bitrate,
+            sdr_bitrate=config.sdr_bitrate, skip_hdr=config.skip_hdr,
+            hdr_only=config.hdr_only,
+        )
+        _report_library(root, videos, plan, echo)
+
+        refusal = plan.refusal(free_bytes=_free_bytes(root), max_convert=None,
+                               min_free=config.min_free_bytes)
+        if refusal:
+            echo(f"\n{refusal}", fg=typer.colors.RED, err=True)
+            return 2
+        if config.dry_run:
+            _report_dry_run(plan, config, echo)
+            return 0
+
+        def finish(job: oj.OptimiseJob, config: VideoOptimiseConfig) -> None:
+            _cleanup_locals(job, config, echo=echo, confirm=confirm,
+                            trash_fn=trash_fn, status=oj.STATUS_CONVERTED)
+
+        if not plan.candidates:
+            # Nothing NEW to convert this run — but an earlier run may have
+            # been interrupted after converting and before the Trash step,
+            # and that offer belongs on every run, not just the one that
+            # produced it (the same reasoning run_optimise applies to a
+            # pending hand-off).
+            if job.needs_local_cleanup(oj.STATUS_CONVERTED):
+                finish(job, config)
+                return 0
+            echo("Nothing worth optimising.", fg=typer.colors.GREEN)
+            return 0
+
+        code = _run_phases(job, config, plan, videos, None,
+                           echo=echo, progress=progress, confirm=confirm,
+                           choose=choose, compare=compare, cancel=cancel,
+                           probe_fn=probe_fn, convert_fn=convert_fn,
+                           infer_date_fn=_infer_date_for_video, finish=finish)
+    return code
+
+
 def _report_dry_run(plan: vo.OptimisePlan, config: VideoOptimiseConfig, echo) -> None:
     echo("\nDry run — nothing will be converted, uploaded or deleted.",
          fg=typer.colors.YELLOW)
@@ -1126,8 +1246,16 @@ def _run_phases(
     job: oj.OptimiseJob, config: VideoOptimiseConfig, plan: vo.OptimisePlan,
     videos, armed: ArmedICloud | None, *, echo, progress,
     confirm, choose, compare, cancel, probe_fn, convert_fn,
+    infer_date_fn: Callable[[Path, str], datetime | None] | None = None,
+    finish: Callable[[oj.OptimiseJob, VideoOptimiseConfig], None] | None = None,
 ) -> int:
-    """Select → convert → review → hand off. No iCloud mutation happens here."""
+    """Select → convert → review → hand off. No iCloud mutation happens here.
+
+    ``finish`` replaces the final hand-off-to-iCloud step; ``None`` (the
+    ``video-optimise`` default) means "print the hand-off instructions".
+    ``video-optimise-external`` passes its own local-Trash step instead — see
+    :func:`run_optimise_external`.
+    """
     state_db = armed.config.app.state_db if armed is not None else None
     counts = job.counts()
     if counts[oj.STATUS_SELECTED]:
@@ -1151,7 +1279,8 @@ def _run_phases(
             return 0
 
     totals = _convert_all(job, config, echo=echo, progress=progress, cancel=cancel,
-                          convert_fn=convert_fn, probe_fn=probe_fn, state_db=state_db)
+                          convert_fn=convert_fn, probe_fn=probe_fn, state_db=state_db,
+                          infer_date_fn=infer_date_fn)
     if cancel is not None and cancel.is_set():
         return 130
 
@@ -1186,7 +1315,10 @@ def _run_phases(
 
     _discard_rejected(job, config, echo=echo, confirm=confirm)
     _report_conversion(job, totals, echo)
-    _report_handoff(job, config, echo)
+    if finish is not None:
+        finish(job, config)
+    else:
+        _report_handoff(job, config, echo)
     return 1 if totals.failed else 0
 
 

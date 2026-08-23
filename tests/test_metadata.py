@@ -425,3 +425,174 @@ def test_already_present_image_is_never_stamped(tmp_path, monkeypatch):
 
     assert outcome is md.MetadataOutcome.ALREADY_PRESENT
     assert len(calls) == 1
+
+
+# --- read_embedded_capture_date -----------------------------------------------
+
+
+def test_read_video_embedded_date_prefers_creation_time(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        _ffprobe_tags_run({
+            "creation_time": "2019-10-25T15:07:50Z",
+            "com.apple.quicktime.creationdate": "2019-10-25T18:07:50+0300",
+        }),
+    )
+    assert md.read_embedded_capture_date(src) == datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+
+
+def test_read_video_embedded_date_falls_back_to_quicktime_tag(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        _ffprobe_tags_run({"com.apple.quicktime.creationdate": "2019-10-25T18:07:50+0300"}),
+    )
+    dt = md.read_embedded_capture_date(src)
+    assert dt == datetime(2019, 10, 25, 18, 7, 50, tzinfo=dt.tzinfo)
+    assert dt.utcoffset().total_seconds() == 3 * 3600
+
+
+def test_read_video_embedded_date_none_when_neither_tag_present(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(subprocess, "run", _ffprobe_tags_run({}))
+    assert md.read_embedded_capture_date(src) is None
+
+
+def test_read_image_embedded_date(tmp_path, monkeypatch):
+    src = tmp_path / "photo.heic"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(returncode=0, stdout="2019:10:25 15:07:50\n\n", stderr=""),
+    )
+    assert md.read_embedded_capture_date(src) == datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+
+
+def test_read_embedded_date_none_for_unsupported_suffix(tmp_path):
+    assert md.read_embedded_capture_date(tmp_path / "notes.txt") is None
+
+
+# --- infer_capture_date_from_name ----------------------------------------------
+
+
+class TestInferFromName:
+    def test_whatsapp_image_name_gets_noon(self):
+        dt = md.infer_capture_date_from_name("IMG-20191025-WA0007.jpg")
+        assert dt == datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_whatsapp_video_name_gets_noon(self):
+        dt = md.infer_capture_date_from_name("VID-20191025-WA0003.mp4")
+        assert dt == datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_camera_datetime_name_keeps_the_exact_time(self):
+        dt = md.infer_capture_date_from_name("IMG_20191025_150712.jpg")
+        assert dt == datetime(2019, 10, 25, 15, 7, 12, tzinfo=timezone.utc)
+
+    def test_bare_datetime_name_with_no_img_prefix(self):
+        dt = md.infer_capture_date_from_name("20191025_150712.mp4")
+        assert dt == datetime(2019, 10, 25, 15, 7, 12, tzinfo=timezone.utc)
+
+    def test_datetime_pattern_preferred_over_date_only_when_both_could_apply(self):
+        # Not a realistic filename, but pins the stated precedence: the more
+        # informative match wins when the regexes could both fire.
+        dt = md.infer_capture_date_from_name("20191025_150712-WA0001.jpg")
+        assert dt == datetime(2019, 10, 25, 15, 7, 12, tzinfo=timezone.utc)
+
+    def test_no_recognisable_pattern_is_unknown(self):
+        assert md.infer_capture_date_from_name("holiday_photo_final_v2.jpg") is None
+
+    def test_invalid_calendar_date_in_camera_pattern_is_rejected(self):
+        # Month 13 — looks like the shape, isn't a real date.
+        assert md.infer_capture_date_from_name("IMG_20191325_150712.jpg") is None
+
+    def test_invalid_calendar_date_in_whatsapp_pattern_is_rejected(self):
+        assert md.infer_capture_date_from_name("IMG-20190231-WA0007.jpg") is None  # Feb 31
+
+    def test_coincidental_eight_digits_without_the_right_shape_is_not_matched(self):
+        # A serial number or resolution tag must not masquerade as a date.
+        assert md.infer_capture_date_from_name("DSC12345678.jpg") is None
+
+
+# --- infer_capture_date_from_path -----------------------------------------------
+
+
+class TestInferFromPath:
+    def test_year_month_folder_gives_the_15th_at_noon_utc(self):
+        dt = md.infer_capture_date_from_path("2019/10/clip.mp4")
+        assert dt == datetime(2019, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_nested_deeper_still_uses_the_first_two_parts(self):
+        dt = md.infer_capture_date_from_path("2019/10/subalbum/clip.mp4")
+        assert dt == datetime(2019, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_invalid_month_is_rejected(self):
+        assert md.infer_capture_date_from_path("2019/13/clip.mp4") is None
+
+    def test_unknown_date_folder_is_not_a_year(self):
+        assert md.infer_capture_date_from_path("unknown-date/clip.mp4") is None
+
+    def test_flat_file_with_no_folder_at_all(self):
+        assert md.infer_capture_date_from_path("clip.mp4") is None
+
+    def test_a_plausible_looking_but_out_of_range_year_is_rejected(self):
+        assert md.infer_capture_date_from_path("1899/10/clip.mp4") is None
+
+
+# --- infer_capture_date (the full ladder) ---------------------------------------
+
+
+class TestInferCaptureDate:
+    def test_embedded_date_wins_over_filename_and_folder(self, tmp_path, monkeypatch):
+        src = tmp_path / "IMG-20200101-WA0001.mov"
+        src.write_bytes(b"x")
+        monkeypatch.setattr(
+            subprocess, "run",
+            _ffprobe_tags_run({"creation_time": "2019-10-25T15:07:50Z"}),
+        )
+        dt, source = md.infer_capture_date(src, "2021/06/IMG-20200101-WA0001.mov")
+        assert dt == datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+        assert source == md.SOURCE_EMBEDDED
+
+    def test_filename_wins_over_folder_when_no_embedded_date(self, tmp_path, monkeypatch):
+        src = tmp_path / "IMG-20191025-WA0007.jpg"
+        src.write_bytes(b"x")
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda argv, **kw: SimpleNamespace(returncode=0, stdout="\n\n", stderr=""),
+        )
+        dt, source = md.infer_capture_date(src, "2021/06/IMG-20191025-WA0007.jpg")
+        assert dt == datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+        assert source == md.SOURCE_FILENAME
+
+    def test_folder_is_the_last_resort(self, tmp_path, monkeypatch):
+        src = tmp_path / "holiday.jpg"
+        src.write_bytes(b"x")
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda argv, **kw: SimpleNamespace(returncode=0, stdout="\n\n", stderr=""),
+        )
+        dt, source = md.infer_capture_date(src, "2021/06/holiday.jpg")
+        assert dt == datetime(2021, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        assert source == md.SOURCE_FOLDER
+
+    def test_nothing_found_anywhere_is_unknown(self, tmp_path, monkeypatch):
+        src = tmp_path / "holiday.jpg"
+        src.write_bytes(b"x")
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda argv, **kw: SimpleNamespace(returncode=0, stdout="\n\n", stderr=""),
+        )
+        dt, source = md.infer_capture_date(src, "holiday.jpg")
+        assert dt is None
+        assert source == md.SOURCE_UNKNOWN
+
+    def test_unsupported_suffix_skips_straight_to_filename(self, tmp_path):
+        src = tmp_path / "IMG-20191025-WA0007.txt"
+        src.write_bytes(b"x")
+        dt, source = md.infer_capture_date(src, "2021/06/IMG-20191025-WA0007.txt")
+        assert dt == datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+        assert source == md.SOURCE_FILENAME

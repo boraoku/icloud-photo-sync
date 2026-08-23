@@ -18,6 +18,7 @@ import pytest
 
 from icloud_photo_sync import optimise as op
 from icloud_photo_sync import optimise_job as oj
+from icloud_photo_sync import optimise_review as orv
 from icloud_photo_sync import video_optimise as vo
 from icloud_photo_sync.config import VideoOptimiseConfig
 from icloud_photo_sync.errors import ICloudSyncError
@@ -372,6 +373,104 @@ class TestCaptureDateStamping:
 
         assert totals.converted == 1
         assert job.get(rel)["status"] == oj.STATUS_CONVERTED
+
+
+class TestInferDateFn:
+    """_convert_all's other date source — video-optimise-external has no sync
+    manifest at all, so it passes infer_date_fn (the filename/folder ladder)
+    instead of state_db. The two are independent: video-optimise never sets
+    infer_date_fn, video-optimise-external never sets state_db."""
+
+    def test_infer_date_fn_used_when_no_manifest(self, job, config, monkeypatch):
+        rel, _ = seed_selected(job, config)
+        calls = []
+
+        def fake_ensure(path, capture_dt, **kw):
+            calls.append((path, capture_dt))
+            return MetadataOutcome.STAMPED
+
+        monkeypatch.setattr(op.md, "ensure_capture_date", fake_ensure)
+        inferred = datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+        totals = op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+            infer_date_fn=lambda src, rel: inferred,
+        )
+
+        assert totals.converted == 1
+        assert len(calls) == 1
+        stamped_path, stamped_dt = calls[0]
+        assert stamped_path == config.work_path(vo.flat_name(rel))
+        assert stamped_dt == inferred
+
+    def test_infer_date_fn_receives_the_source_path_and_rel(self, job, config, monkeypatch):
+        rel, _ = seed_selected(job, config)
+        seen = []
+        monkeypatch.setattr(op.md, "ensure_capture_date",
+                            lambda *a, **kw: MetadataOutcome.STAMPED)
+
+        def infer(src, r):
+            seen.append((src, r))
+            return datetime(2019, 10, 25, tzinfo=timezone.utc)
+
+        op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+            infer_date_fn=infer,
+        )
+
+        assert seen == [(config.output_root / rel, rel)]
+
+    def test_no_stamp_call_when_infer_date_fn_finds_nothing(self, job, config, monkeypatch):
+        rel, _ = seed_selected(job, config)
+        calls = []
+        monkeypatch.setattr(op.md, "ensure_capture_date",
+                            lambda *a, **kw: calls.append(1) or MetadataOutcome.STAMPED)
+
+        op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+            infer_date_fn=lambda src, rel: None,
+        )
+
+        assert calls == []
+
+    def test_manifest_takes_priority_over_infer_date_fn_when_both_given(self, job, config, monkeypatch, tmp_path):
+        # Not a real combination any current caller produces, but the
+        # priority order is deliberate: a manifest's recorded capture_dt is
+        # authoritative where it exists, an inferred one is a fallback guess.
+        rel, _ = seed_selected(job, config)
+        from icloud_photo_sync.config import AppConfig
+        from icloud_photo_sync.models import AssetRef
+        from icloud_photo_sync.state import StateStore
+
+        app = AppConfig.create("t@e.com", tmp_path / "tree", config_root=tmp_path / "cfg")
+        manifest_dt = datetime(2019, 10, 25, tzinfo=timezone.utc)
+        with StateStore(app.state_db) as state:
+            state.register(AssetRef(id="OLD", filename=Path(rel).name,
+                                    capture_dt=manifest_dt, added_dt=None, size=None), rel)
+
+        calls = []
+        monkeypatch.setattr(op.md, "ensure_capture_date",
+                            lambda path, dt, **kw: calls.append(dt) or MetadataOutcome.STAMPED)
+
+        op._convert_all(
+            job, config, echo=lambda *a, **k: None,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=lambda p, r: make_probe(rel=rel, size=25 * 1024 * 1024,
+                                             width=1080, height=1920),
+            state_db=app.state_db,
+            infer_date_fn=lambda src, rel: datetime(2000, 1, 1, tzinfo=timezone.utc),
+        )
+
+        assert calls == [manifest_dt]
 
 
 # --- confirmation ------------------------------------------------------------
@@ -1024,3 +1123,138 @@ class TestDryRunTouchesNothing:
                                           retry_colour_mismatch=True)
         self._run(real_config)
         assert job.get(rel)["status"] == oj.STATUS_SELECTED
+
+
+# --- run_optimise_external: the local-only sibling, no iCloud at all -----------
+
+
+class TestRunOptimiseExternal:
+    """The whole point of this command: everything video-optimise does
+    locally, none of what it does with iCloud. Every test here either proves
+    the local behaviour matches, or proves iCloud is never touched."""
+
+    def _config(self, tmp_path, **overrides):
+        root = (tmp_path / "tree").resolve()
+        root.mkdir(exist_ok=True)
+        return VideoOptimiseConfig.create(
+            root, config_root=tmp_path / "cfg",
+            db_prefix="video-optimise-external", **overrides,
+        )
+
+    def _seed_source(self, config, name, size=300 * 1024 * 1024):
+        src = config.output_root / name
+        src.parent.mkdir(parents=True, exist_ok=True)
+        _sparse(src, size)
+        return src
+
+    @staticmethod
+    def _default_trash_fn(paths):
+        from icloud_photo_sync.trash import TrashResult
+        for p in paths:
+            p.unlink(missing_ok=True)
+        return [TrashResult(path=p, ok=True) for p in paths]
+
+    def _run(self, config, monkeypatch, *, choose=None, compare=None,
+             convert_fn=None, probe_fn=None, confirm=None, trash_fn=None):
+        monkeypatch.setattr(op.tc, "ffmpeg_available", lambda: True)
+        monkeypatch.setattr(op.tc, "encoder_available", lambda name=None: True)
+        return op.run_optimise_external(
+            config,
+            echo=lambda *a, **k: None,
+            confirm=confirm or (lambda *a, **k: True),
+            choose=choose or (lambda items, **kw: {0}),
+            compare=compare or (lambda *a, **k: orv.SelectionOutcome(
+                set(), orv.CHOICE_APPROVE_ALL)),
+            trash_fn=trash_fn or self._default_trash_fn,
+            convert_fn=convert_fn, probe_fn=probe_fn,
+        )
+
+    def test_no_videos_found(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path)
+        code = self._run(config, monkeypatch)
+        assert code == 0
+
+    def test_full_local_flow_converts_stamps_and_offers_trash(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path)
+        name = "VID-20191025-WA0003.mp4"
+        self._seed_source(config, name)
+
+        # probe_fn serves double duty in the real flow: once to scan the
+        # (large) source during the initial plan, again to read back the
+        # (small) converted output afterwards — same callable, different
+        # paths, so it has to distinguish them by location.
+        source_probe = make_probe(rel=name, size=300 * 1024 * 1024,
+                                  width=3840, height=2160)
+        out = make_probe(rel=name, size=25 * 1024 * 1024, width=1080, height=1920)
+
+        def probe_fn(p, r):
+            return out if config.work_dir in p.parents else source_probe
+
+        stamped = []
+
+        def fake_ensure(path, capture_dt, **kw):
+            stamped.append((path, capture_dt))
+            return MetadataOutcome.STAMPED
+
+        monkeypatch.setattr(op.md, "ensure_capture_date", fake_ensure)
+
+        trashed = []
+
+        def trash_fn(paths):
+            trashed.extend(paths)
+            from icloud_photo_sync.trash import TrashResult
+            for p in paths:
+                p.unlink(missing_ok=True)
+            return [TrashResult(path=p, ok=True) for p in paths]
+
+        code = self._run(
+            config, monkeypatch,
+            convert_fn=fake_convert(25 * 1024 * 1024),
+            probe_fn=probe_fn,
+            trash_fn=trash_fn,
+        )
+
+        assert code == 0
+        # The source had no embedded date; the filename ladder found one.
+        assert len(stamped) == 1
+        stamped_path, stamped_dt = stamped[0]
+        assert stamped_dt == datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Original moved to Trash, optimised copy took its place.
+        assert trashed == [config.output_root / name]
+        placed = (config.output_root / name).with_suffix(".mov")
+        assert placed.exists()
+        assert not (config.output_root / name).exists()
+
+    def test_nothing_worth_optimising_is_a_clean_no_op(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path)
+        self._seed_source(config, "tiny.mp4", size=1024)  # well under --min-size
+
+        code = self._run(config, monkeypatch)
+        assert code == 0
+
+    def test_dry_run_does_not_convert_or_mutate(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path, dry_run=True)
+        name = "clip.mp4"
+        self._seed_source(config, name)
+
+        calls = []
+        code = self._run(
+            config, monkeypatch,
+            convert_fn=lambda *a, **k: calls.append(1),
+            probe_fn=lambda p, r: make_probe(rel=name, size=280 * 1024 * 1024,
+                                             width=3840, height=2160),
+        )
+
+        assert code == 0
+        assert calls == []
+        assert (config.output_root / name).exists()  # untouched
+
+    def test_never_imports_or_calls_icloud_machinery(self):
+        # run_optimise_external's own source: no arm(), no ArmedICloud, no
+        # ICloudDeleteConfig ever constructed on this path. A grep-level
+        # guarantee, not just "the tests happened not to need one".
+        import inspect
+        src = inspect.getsource(op.run_optimise_external)
+        for forbidden in ("arm(", "ArmedICloud", "ICloudDeleteConfig", "SessionManager"):
+            assert forbidden not in src, f"{forbidden!r} must never appear in run_optimise_external"

@@ -118,6 +118,14 @@ icloud-photo-sync [GLOBAL] local-clean [--max-size SIZE] [--lm-url URL]
 icloud-photo-sync [GLOBAL] video-clean [--min-size SIZE] [--port N] [--no-browser]
                                        [--icloud-delete] [--icloud-dry-run]
                                        [--max-delete N]
+icloud-photo-sync [GLOBAL] video-optimise-external [--min-size SIZE] [--short-side N]
+                                       [--max-fps N] [--hdr-bitrate RATE] [--sdr-bitrate RATE]
+                                       [--skip-hdr] [--hdr-only] [--limit N] [--restart]
+                                       [--retry-colour-mismatch] [--dry-run]
+                                       [--port N] [--no-browser]
+icloud-photo-sync [GLOBAL] photo-optimise-external [--max-size SIZE] [--lm-url URL]
+                                       [--lm-model NAME] [--flag CATS] [--limit N]
+                                       [--reclassify] [--no-browser] [--dry-run]
 icloud-photo-sync [GLOBAL] icloud-delete (--last | --from MANIFEST | --explain RECEIPT
                                         | --scan-trashed)
                                        [--dry-run] [--max-delete N]
@@ -151,6 +159,9 @@ GLOBAL options:
   capture date, location, HDR colour and (for slow motion) the frame rate; you
   upload the results yourself, and it reconciles them back into your library.
   See the section below.
+* **`video-optimise-external`** / **`photo-optimise-external`** — the same
+  ideas, but for a folder outside iCloud sync entirely: no upload, no iCloud
+  contact of any kind. See *Working on a folder outside iCloud sync* below.
 * **`icloud-delete`** — finish or retry deleting already-trashed files from
   iCloud, using the manifest a clean session wrote; or `--scan-trashed` to
   reconstruct a session that ran before the flag existed. See *Deleting from
@@ -416,6 +427,61 @@ swap is confirmed.
 **Requires `ffmpeg` with `hevc_videotoolbox`** (`brew install ffmpeg` on Apple
 silicon). The command refuses to start without it rather than falling back to a
 software encoder that would take days.
+
+---
+
+## Working on a folder outside iCloud sync (`-external` commands)
+
+Two commands for photos/videos that already exist on disk but aren't under
+this tool's active iCloud management — an old export, a backup drive,
+anything you already have. **Neither ever contacts iCloud** — no sign-in, no
+upload, no delete of any kind, not even a read-only check.
+
+### `video-optimise-external`
+
+```bash
+icloud-photo-sync video-optimise-external
+```
+
+Everything `video-optimise` does locally — scan, browser review, HEVC
+re-encode, colour/size verification, before/after comparison screen — with
+the iCloud upload/verify/delete phase removed entirely. Once you're happy
+with the conversions it offers to move the **originals** straight to the
+Trash and puts the optimised files in their place, same folder, same names.
+Takes the same flags as `video-optimise` except `--offline`/`--reconcile-only`
+(meaningless here — it's always offline, and there's no upload to reconcile).
+
+### `photo-optimise-external`
+
+```bash
+icloud-photo-sync photo-optimise-external
+```
+
+Two phases, always in order:
+
+1. **Recover missing photo dates.** Checks every photo in the folder (not
+   just small ones — the whole library) for a missing capture date and works
+   out one from the file's own metadata, its filename (WhatsApp's
+   `IMG-YYYYMMDD-WA*` / `VID-YYYYMMDD-WA*`, or a generic camera
+   `..._YYYYMMDD_HHMMSS...`), or — last resort — the `YYYY/MM` folder it's
+   sitting in (the 15th at noon). An existing date, even one that looks
+   wrong, is never touched. `--dry-run` reports what would be stamped and
+   stops there, without running phase 2.
+2. **`local-clean`, unchanged.** Scans for small screenshots/memes, reviews
+   them in a browser, moves your picks to Trash — the same command described
+   above, just called automatically right after phase 1. Takes the same
+   flags as `local-clean` except `--icloud-delete`/`--icloud-dry-run`/
+   `--max-delete` (this command never touches iCloud, even optionally).
+
+### Both commands, shared date-recovery rule
+
+Both `-external` commands set a stamped file's filesystem modified-date to
+match, for the same reason `sync` and `video-optimise` already do: a future
+re-import falls back to that date when nothing is embedded. A date found by
+filename has no time of day, so it gets 12:00 noon; a date found only from
+the enclosing folder has no day either, so it gets the 15th at 12:00 UTC —
+the middle of the only interval actually known, never a guess where no
+signal exists at all.
 
 ---
 

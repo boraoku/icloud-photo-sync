@@ -296,6 +296,41 @@ def test_swapped_query(job):
     assert rels == ["s.mov"]
 
 
+def test_needs_local_cleanup_defaults_to_swapped(job):
+    _add(job, rel="s.mov")
+    job.mark_converted("s.mov", out_rel="o", out_bytes=1, out_probe=None)
+    job.mark_uploaded("s.mov", "asset-x")
+    job.mark_swapped("s.mov")
+    _add(job, rel="only-converted.mov")
+    job.mark_converted("only-converted.mov", out_rel="o2", out_bytes=1, out_probe=None)
+
+    rels = [r["rel"] for r in job.needs_local_cleanup()]
+    assert rels == ["s.mov"]
+
+
+def test_needs_local_cleanup_with_explicit_status_for_external(job):
+    # video-optimise-external has no swap phase to ever produce STATUS_SWAPPED
+    # — it passes STATUS_CONVERTED instead once a row has passed the reject
+    # screen, and that must not also pick up a real swapped row from a
+    # completely different (cloud) workflow.
+    _add(job, rel="s.mov")
+    job.mark_converted("s.mov", out_rel="o", out_bytes=1, out_probe=None)
+    job.mark_uploaded("s.mov", "asset-x")
+    job.mark_swapped("s.mov")
+    _add(job, rel="c.mov")
+    job.mark_converted("c.mov", out_rel="o2", out_bytes=1, out_probe=None)
+
+    rels = [r["rel"] for r in job.needs_local_cleanup(STATUS_CONVERTED)]
+    assert rels == ["c.mov"]
+
+
+def test_needs_local_cleanup_excludes_already_done_rows(job):
+    _add(job, rel="c.mov")
+    job.mark_converted("c.mov", out_rel="o", out_bytes=1, out_probe=None)
+    job.mark_local_done("c.mov")
+    assert job.needs_local_cleanup(STATUS_CONVERTED) == []
+
+
 def test_by_status_multiple(job):
     _add(job, rel="a.mov")
     _add(job, rel="b.mov")

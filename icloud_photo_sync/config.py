@@ -364,6 +364,7 @@ class VideoOptimiseConfig:
         *,
         apple_id: str | None = None,
         config_root: Path | None = None,
+        db_prefix: str = "video-optimise",
         **overrides,
     ) -> "VideoOptimiseConfig":
         output_root = Path(output_root).resolve()
@@ -375,6 +376,12 @@ class VideoOptimiseConfig:
 
         # Keyed by the folder alone when no Apple ID is in play (--no-upload), so
         # an offline run and a later online one on the same tree share one job.
+        # ``db_prefix`` keeps that sharing scoped to video-optimise itself:
+        # video-optimise-external has no Apple ID either, ever, but it is a
+        # different job with a different status vocabulary (no upload/swap
+        # phase can ever produce those statuses there) — without a distinct
+        # prefix it would silently share video-optimise's own job database on
+        # the same folder and corrupt both commands' bookkeeping.
         key = (_state_key(apple_id, output_root) if apple_id
                else _clean_cache_key(output_root))
 
@@ -399,7 +406,7 @@ class VideoOptimiseConfig:
 
         cfg = cls(
             output_root=output_root, logs_dir=logs_dir, work_dir=work_dir,
-            job_db=state_dir / f"video-optimise-{key}.db",
+            job_db=state_dir / f"{db_prefix}-{key}.db",
             poster_cache_dir=poster_cache_dir,
         )
         for k, v in overrides.items():
