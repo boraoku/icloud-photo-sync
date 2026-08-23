@@ -10,6 +10,7 @@ what stops the suite being satisfied by a no-op.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -416,6 +417,60 @@ class TestRetryFailedDeletes:
         assert ok is True and client.deleted == ["OLD"]
 
 
+class TestRetryColourMismatch:
+    """Unlike a failed delete, a colour mismatch is never retried automatically
+    — it usually means the file has a genuine, repeatable problem, and blindly
+    re-attempting it every run would burn hours re-encoding the same 4K clip
+    forever. ``--retry-colour-mismatch`` exists for the one case retrying is
+    right: a fix to the encoding policy itself. Without this, classify() being
+    fixed is inert for a real file, because job.add() refuses to move a
+    terminal-state row back to 'selected' — colour_mismatch is terminal.
+    """
+
+    def _seed_mismatch(self, job, config, rel="2024/05/IMG_1.MOV"):
+        source = make_probe(rel=rel, size=140 * 1024 * 1024)
+        job.add(rel, asset_id="OLD", src_bytes=source.size,
+                src_probe=op._probe_dict(source),
+                plan=op._encode_dict(vo.choose_encode(source)))
+        job.mark_skipped(rel, oj.STATUS_COLOUR_MISMATCH,
+                         "HLG HDR 8-bit → HLG HDR 10-bit")
+        return rel
+
+    def test_retry_sends_mismatched_rows_back_to_selected(self, job, config):
+        rel = self._seed_mismatch(job, config)
+        assert job.pending_conversion() == []          # the stranding, demonstrated
+        assert job.retry_colour_mismatch() == 1
+        row = job.get(rel)
+        assert row["status"] == oj.STATUS_SELECTED
+        assert row["out_rel"] is None and row["error"] is None
+
+    def test_retry_is_a_noop_with_nothing_mismatched(self, job, config):
+        seed_selected(job, config)
+        assert job.retry_colour_mismatch() == 0
+
+    def test_a_retried_row_can_convert_on_the_next_attempt(self, job, config):
+        rel = self._seed_mismatch(job, config)
+        job.retry_colour_mismatch()
+        assert [r["rel"] for r in job.pending_conversion()] == [rel]
+
+    def test_other_terminal_statuses_are_untouched(self, job, config):
+        # Scoped narrowly: a run declining to retry not_worth_it/rejected rows
+        # is a design choice, not an oversight this test should let slip.
+        mismatch = self._seed_mismatch(job, config, rel="2024/05/A.MOV")
+        other = seed_selected(job, config, rel="2024/05/B.MOV")[0]
+        job.mark_skipped(other, oj.STATUS_NOT_WORTH_IT, "too small a gain")
+        assert job.retry_colour_mismatch() == 1
+        assert job.get(mismatch)["status"] == oj.STATUS_SELECTED
+        assert job.get(other)["status"] == oj.STATUS_NOT_WORTH_IT
+
+    def test_not_wired_into_the_ordinary_swap_failed_reset(self, job, config):
+        # The two resets are independent: fixing failed deletes must never
+        # silently also retry colour mismatches.
+        rel = self._seed_mismatch(job, config)
+        job.reset_swap_failed()
+        assert job.get(rel)["status"] == oj.STATUS_COLOUR_MISMATCH
+
+
 # --- reconciliation -----------------------------------------------------------
 
 
@@ -747,3 +802,74 @@ class TestLocalState:
         # honest to call finished.
         assert op._local_state(self._row(100, 10),
                                self._file(tmp_path, 55)) == "unknown"
+
+
+# --- run_optimise: --dry-run must not mutate anything --------------------------
+
+
+class TestDryRunTouchesNothing:
+    """Discovered while verifying --retry-colour-mismatch: --dry-run resolves no
+    Apple ID (same as --offline), so it opens a DIFFERENT, offline-keyed job
+    database than an authenticated run of the same command against the same
+    folder. Before this fix, the job-store preamble (restart/backfill/
+    reset_swap_failed/retry_colour_mismatch/migrate_work_dir) ran unconditionally
+    — so "--dry-run --retry-colour-mismatch" silently mutated the wrong database
+    while reporting nothing changed, and "--dry-run --restart" would have wiped
+    it. Both contradict --dry-run's own contract.
+    """
+
+    def _run(self, config, **overrides):
+        import types
+        kwargs = dict(
+            icloud=None, session_factory=lambda app: None,
+            echo=lambda *a, **k: None, progress=None,
+            confirm=lambda *a, **k: False, prompt=lambda *a, **k: "",
+            choose=lambda *a, **k: set(), compare=lambda *a, **k: None,
+            cancel=None, probe_fn=lambda p, r: None, convert_fn=lambda *a, **k: None,
+        )
+        kwargs.update(overrides)
+        return op.run_optimise(config, **kwargs)
+
+    def test_dry_run_does_not_reset_colour_mismatch(self, monkeypatch, job, config):
+        monkeypatch.setattr(op.tc, "ffmpeg_available", lambda: True)
+        monkeypatch.setattr(op.tc, "encoder_available", lambda name=None: True)
+        rel = "2024/05/IMG_1.MOV"
+        source = make_probe(rel=rel, size=140 * 1024 * 1024)
+        job.add(rel, asset_id="OLD", src_bytes=source.size,
+                src_probe=op._probe_dict(source),
+                plan=op._encode_dict(vo.choose_encode(source)))
+        job.mark_skipped(rel, oj.STATUS_COLOUR_MISMATCH, "HLG HDR 8-bit -> 10-bit")
+        job.flush()
+
+        dry_config = dataclasses.replace(config, dry_run=True,
+                                         retry_colour_mismatch=True)
+        self._run(dry_config)
+        assert job.get(rel)["status"] == oj.STATUS_COLOUR_MISMATCH
+
+    def test_dry_run_does_not_clear_restart(self, monkeypatch, job, config):
+        monkeypatch.setattr(op.tc, "ffmpeg_available", lambda: True)
+        monkeypatch.setattr(op.tc, "encoder_available", lambda name=None: True)
+        rel = seed_converted(job, config)
+        job.flush()
+
+        dry_config = dataclasses.replace(config, dry_run=True, restart=True)
+        self._run(dry_config)
+        assert job.get(rel) is not None          # --restart did not wipe the store
+
+    def test_a_real_run_does_apply_the_retry(self, monkeypatch, job, config):
+        # The other half of the fence: outside --dry-run this must still work,
+        # exactly as TestRetryColourMismatch already covers unit-level.
+        monkeypatch.setattr(op.tc, "ffmpeg_available", lambda: True)
+        monkeypatch.setattr(op.tc, "encoder_available", lambda name=None: True)
+        rel = "2024/05/IMG_1.MOV"
+        source = make_probe(rel=rel, size=140 * 1024 * 1024)
+        job.add(rel, asset_id="OLD", src_bytes=source.size,
+                src_probe=op._probe_dict(source),
+                plan=op._encode_dict(vo.choose_encode(source)))
+        job.mark_skipped(rel, oj.STATUS_COLOUR_MISMATCH, "HLG HDR 8-bit -> 10-bit")
+        job.flush()
+
+        real_config = dataclasses.replace(config, dry_run=False,
+                                          retry_colour_mismatch=True)
+        self._run(real_config)
+        assert job.get(rel)["status"] == oj.STATUS_SELECTED

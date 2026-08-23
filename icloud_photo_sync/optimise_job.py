@@ -460,6 +460,29 @@ class OptimiseJob:
         self._maybe_commit()
         return cur.rowcount
 
+    def retry_colour_mismatch(self) -> int:
+        """Send every ``colour_mismatch`` row back to ``selected`` for another try.
+
+        Never called automatically, unlike :meth:`reset_swap_failed`. A colour
+        mismatch means the output was verifiably wrong and the original was
+        kept — usually a genuine, repeatable property of that file, not a
+        transient one like a network hiccup. Auto-retrying it on every run
+        would burn hours re-encoding and re-failing the same 4K HDR clip
+        forever. This exists for the one case retrying *is* right: a fix to the
+        encoding policy itself (verified against real files: bit depth was
+        being promoted from the source's actual 8-bit to a forced 10-bit for
+        any HDR-tagged clip, which the colour check then — correctly — rejected
+        every time). A human asks for that explicitly, once.
+        """
+        cur = self._conn.execute(
+            "UPDATE jobs SET status = 'selected', out_rel = NULL, out_bytes = NULL, "
+            "out_probe = NULL, error = NULL, updated_at = ? "
+            "WHERE status = 'colour_mismatch'",
+            (_now(),),
+        )
+        self._maybe_commit()
+        return cur.rowcount
+
     # --- queries -----------------------------------------------------------
 
     def pending_conversion(self) -> list[sqlite3.Row]:

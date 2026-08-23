@@ -486,6 +486,10 @@ def video_optimise(
     restart: bool = typer.Option(
         False, "--restart", help="Throw away the unfinished job and start over."
     ),
+    retry_colour_mismatch: bool = typer.Option(
+        False, "--retry-colour-mismatch",
+        help="Give videos that failed the colour check one more attempt this run.",
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Plan and print the exact ffmpeg command per file. Change nothing."
     ),
@@ -533,6 +537,7 @@ def video_optimise(
             hdr_only=hdr_only or None,
             limit=limit,
             restart=restart or None,
+            retry_colour_mismatch=retry_colour_mismatch or None,
             dry_run=dry_run or None,
             offline=offline or None,
             reconcile_only=reconcile_only or None,

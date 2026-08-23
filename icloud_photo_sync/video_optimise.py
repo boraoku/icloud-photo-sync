@@ -288,7 +288,15 @@ def choose_encode(
     # resample it to a rounded version of its own rate duplicates and drops
     # frames for no reason at all.
     out_fps = None if (probe.is_slow_motion or probe.fps <= max_fps) else max_fps
-    ten_bit = probe.is_ten_bit or probe.is_hdr
+    # Bit depth follows the MEASURED source depth, never the HDR flag alone.
+    # HLG/PQ almost always ride on a 10-bit source, but not always: a handful
+    # of real files here are 8-bit yuv420p carrying full BT.2020/HLG tags (some
+    # "_cmp_compressed" proxies re-encoded by something other than a camera).
+    # `or probe.is_hdr` used to force those to p010le regardless, producing a
+    # 10-bit output from an 8-bit input — exactly the promotion this module's
+    # docstring says never happens, and accept_output correctly rejected every
+    # one of them afterwards as a colour mismatch (depth "8" -> "10").
+    ten_bit = probe.is_ten_bit
     return Encode(
         width=out_w,
         height=out_h,

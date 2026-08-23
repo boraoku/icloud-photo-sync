@@ -154,6 +154,31 @@ class TestColour:
         enc = vo.choose_encode(probe(pix_fmt="yuv420p10le"))
         assert enc.pix_fmt == vo.PIX_FMT_10BIT
 
+    def test_an_8bit_hdr_source_is_not_promoted_to_10bit(self):
+        # Real files: HLG/BT.2020-tagged re-compressed proxies ("_cmp_compressed")
+        # that are genuinely yuv420p (8-bit). Forcing p010le here used to produce
+        # a 10-bit output from an 8-bit input, which accept_output correctly
+        # rejected every time as a colour mismatch (depth "8" -> "10") — so these
+        # four files silently never got optimised at all.
+        src = hdr_probe(pix_fmt="yuv420p")
+        assert src.is_hdr and not src.is_ten_bit
+        enc = vo.choose_encode(src)
+        assert enc.profile == vo.PROFILE_8BIT and enc.pix_fmt == vo.PIX_FMT_8BIT
+
+    def test_an_8bit_hdr_encode_then_passes_its_own_colour_check(self):
+        # The regression fence one level up: choose_encode's output must be
+        # something accept_output will actually accept, not just individually
+        # "correct" fields that still fail the real gate.
+        src = hdr_probe(pix_fmt="yuv420p", size=140 * 1024 * 1024, duration=20.0)
+        enc = vo.choose_encode(src)
+        output = vo.VideoProbe(
+            rel=src.rel, size=vo.predicted_size(src, enc), width=enc.width,
+            height=enc.height, fps=enc.fps or src.fps, duration=src.duration,
+            pix_fmt=enc.pix_fmt, transfer=enc.transfer, primaries=enc.primaries,
+            colorspace=enc.colorspace,
+        )
+        assert vo.accept_output(src, output) is None
+
     def test_the_colour_triplet_is_copied_not_chosen(self):
         enc = vo.choose_encode(hdr_probe())
         assert (enc.transfer, enc.primaries, enc.colorspace) == (

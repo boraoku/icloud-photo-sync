@@ -955,17 +955,30 @@ def run_optimise(
     totals = Totals()
 
     with oj.OptimiseJob(config.job_db) as job:
-        if config.restart:
-            job.clear()
         state_db = armed.config.app.state_db if armed is not None else None
-        if state_db is not None:
-            _backfill_asset_ids(job, state_db)
-        # "Re-run to retry" has to be true: a failed delete goes back to the
-        # queue rather than stranding its conversion forever. This runs BEFORE
-        # the migration, which only considers live rows — otherwise a job whose
-        # last run ended in failures would never get its files moved.
-        job.reset_swap_failed()
-        _migrate_work_dir(job, config, echo)
+        # Every one of these is a real mutation — job-store rows, files moved on
+        # disk — so none of it runs under --dry-run, which promises the library
+        # is left exactly as found. (Also protects against a sharp edge: a
+        # dry-run resolves no Apple ID, so it opens a *different*, offline-keyed
+        # job database than an authenticated run of the same command — mutating
+        # it here would silently touch the wrong store rather than nothing.)
+        if not config.dry_run:
+            if config.restart:
+                job.clear()
+            if state_db is not None:
+                _backfill_asset_ids(job, state_db)
+            # "Re-run to retry" has to be true: a failed delete goes back to the
+            # queue rather than stranding its conversion forever. This runs
+            # BEFORE the migration, which only considers live rows — otherwise a
+            # job whose last run ended in failures would never get its files
+            # moved.
+            job.reset_swap_failed()
+            if config.retry_colour_mismatch:
+                retried = job.retry_colour_mismatch()
+                if retried:
+                    echo(f"--retry-colour-mismatch: giving {retried} video(s) "
+                         "another attempt.", fg=typer.colors.BLUE)
+            _migrate_work_dir(job, config, echo)
 
         # --- phase one: finish what is already in flight ---------------------
         if armed is not None:

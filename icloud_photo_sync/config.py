@@ -347,6 +347,10 @@ class VideoOptimiseConfig:
     """
     reconcile_only: bool = False
     """Finish yesterday's uploads and stop: reconcile, delete, clean up."""
+    retry_colour_mismatch: bool = False
+    """Give every ``colour_mismatch`` row one more attempt. See
+    :meth:`icloud_photo_sync.optimise_job.OptimiseJob.retry_colour_mismatch`
+    for why this needs an explicit flag rather than happening on every run."""
     restart: bool = False
 
     port: int = 0
