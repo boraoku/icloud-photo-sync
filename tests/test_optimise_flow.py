@@ -234,6 +234,48 @@ class TestConversionGate:
         assert job.get(first)["status"] == oj.STATUS_SELECTED
         assert job.get(second)["status"] == oj.STATUS_SELECTED
 
+    def test_a_row_with_no_stored_plan_gets_one_recomputed_from_its_probe(self, job, config):
+        # The regression this pins down happened live: retry_colour_mismatch()
+        # flipped a row back to 'selected' but its stored plan still carried
+        # the pre-fix decision (main10/p010le for an 8-bit HDR source). The
+        # very next real run reused that stale plan verbatim and reproduced
+        # the exact colour mismatch the retry existed to fix. A missing plan
+        # must be recomputed from the retained probe under CURRENT policy, not
+        # treated as a hard failure and not silently trusted from cache.
+        rel = "2024/05/IMG_1.MOV"
+        source = make_probe(rel=rel, pix_fmt="yuv420p",     # 8-bit HDR: the real shape
+                            size=140 * 1024 * 1024, duration=20.0)
+        stale_plan = op._encode_dict(vo.Encode(               # the pre-fix, wrong decision
+            width=1080, height=1920, fps=30.0, bitrate=8_000_000,
+            profile=vo.PROFILE_10BIT, pix_fmt=vo.PIX_FMT_10BIT,
+            transfer="arib-std-b67", primaries="bt2020", colorspace="bt2020nc"))
+        job.add(rel, asset_id="OLD", src_bytes=source.size,
+                src_probe=op._probe_dict(source), plan=stale_plan)
+        job.mark_skipped(rel, oj.STATUS_COLOUR_MISMATCH, "stale plan, pre-fix")
+        job.retry_colour_mismatch()
+        assert job.get(rel)["plan"] is None            # the fix under test
+
+        seen_encodes = []
+
+        def convert(src, dest, encode, **kw):
+            seen_encodes.append(encode)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x" * (30 * 1024 * 1024))
+            return ConvertResult(ok=True, size=30 * 1024 * 1024)
+
+        output = make_probe(rel=rel, size=30 * 1024 * 1024, width=1080, height=1920,
+                            pix_fmt="yuv420p", transfer="arib-std-b67",
+                            primaries="bt2020", colorspace="bt2020nc")
+        convert_all(job, config, convert_fn=convert, probe_fn=lambda p, r: output)
+
+        assert len(seen_encodes) == 1
+        # The recomputed plan must follow the CURRENT policy (8-bit, matching
+        # the source), not the stale cached one -- this is what a real
+        # ffmpeg invocation would have received.
+        assert seen_encodes[0].pix_fmt == vo.PIX_FMT_8BIT
+        assert seen_encodes[0].profile == vo.PROFILE_8BIT
+        assert job.get(rel)["status"] == oj.STATUS_CONVERTED
+
 
 # --- confirmation ------------------------------------------------------------
 
@@ -443,6 +485,18 @@ class TestRetryColourMismatch:
         row = job.get(rel)
         assert row["status"] == oj.STATUS_SELECTED
         assert row["out_rel"] is None and row["error"] is None
+
+    def test_retry_clears_the_stale_plan_but_keeps_the_probe(self, job, config):
+        # Observed live: without this, the row bounced straight back to
+        # colour_mismatch on the very next real run, still carrying the
+        # pre-fix plan (main10/p010le) that caused the original failure — the
+        # retry looked like it worked (status flipped) but silently reproduced
+        # the exact bug it existed to fix.
+        rel = self._seed_mismatch(job, config)
+        job.retry_colour_mismatch()
+        row = job.get(rel)
+        assert row["plan"] is None
+        assert oj.probe_of(row) is not None
 
     def test_retry_is_a_noop_with_nothing_mismatched(self, job, config):
         seed_selected(job, config)

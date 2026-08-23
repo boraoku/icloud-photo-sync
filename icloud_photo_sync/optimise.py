@@ -284,13 +284,26 @@ def _convert_all(
             rel = row["rel"]
             src = config.output_root / rel
             probe_data = oj.probe_of(row)
-            plan_data = oj.plan_of(row)
-            if probe_data is None or plan_data is None:
-                job.mark_skipped(rel, oj.STATUS_CONVERT_FAILED, "no recorded plan")
+            if probe_data is None:
+                job.mark_skipped(rel, oj.STATUS_CONVERT_FAILED, "no recorded source probe")
                 totals.failed += 1
                 continue
             source = vo.VideoProbe(**probe_data)
-            encode = vo.Encode(**plan_data)
+
+            plan_data = oj.plan_of(row)
+            if plan_data is None:
+                # No stored plan: recompute from the retained probe using
+                # whatever the current policy says. This is what
+                # retry_colour_mismatch() relies on — a stale cached plan can
+                # reproduce exactly the failure a retry exists to fix, since
+                # it was a *decision* made under code that has since changed,
+                # not a measurement of the file.
+                encode = vo.choose_encode(
+                    source, short_side=config.short_side, max_fps=config.max_fps,
+                    hdr_bitrate=config.hdr_bitrate, sdr_bitrate=config.sdr_bitrate,
+                )
+            else:
+                encode = vo.Encode(**plan_data)
             # Named at the moment of conversion, against what is already there:
             # the flat folder collides where the dated tree did not (17 real
             # collisions among 647 candidates on the library this was built for).

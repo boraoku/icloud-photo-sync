@@ -473,10 +473,21 @@ class OptimiseJob:
         being promoted from the source's actual 8-bit to a forced 10-bit for
         any HDR-tagged clip, which the colour check then — correctly — rejected
         every time). A human asks for that explicitly, once.
+
+        ``plan`` is cleared along with the output columns, deliberately —
+        ``src_probe`` is retained. The plan is a *decision* made by whatever
+        policy code was running when the row was first selected, and that is
+        exactly what a policy fix invalidates; the probe is a *measurement* of
+        the source file, unaffected by any code change. A row retried with its
+        stale plan intact reproduces the exact failure the retry exists to fix
+        (observed live: the row bounced straight back to ``colour_mismatch``,
+        still carrying the pre-fix ``main10``/``p010le`` plan, on the very next
+        real run). Clearing it is what makes ``_convert_all`` recompute the
+        encode from the retained probe using whatever the policy says *now*.
         """
         cur = self._conn.execute(
-            "UPDATE jobs SET status = 'selected', out_rel = NULL, out_bytes = NULL, "
-            "out_probe = NULL, error = NULL, updated_at = ? "
+            "UPDATE jobs SET status = 'selected', plan = NULL, out_rel = NULL, "
+            "out_bytes = NULL, out_probe = NULL, error = NULL, updated_at = ? "
             "WHERE status = 'colour_mismatch'",
             (_now(),),
         )

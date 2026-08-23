@@ -11,7 +11,7 @@ import re
 import signal
 from pathlib import Path
 from threading import Event
-from typing import Optional
+from typing import Callable, Optional
 
 import typer
 from tqdm import tqdm
@@ -181,6 +181,29 @@ def _output_root(octx: "AppContext") -> Path:
 def _fail(message: str, code: int) -> None:
     typer.secho(message, fg=typer.colors.RED, err=True)
     raise typer.Exit(code)
+
+
+def _run_guarded(command: Callable[[], int]) -> None:
+    """Run one command body, turning an iCloud auth failure into the same
+    clean "Run: icloud-photo-sync login" guidance every command gives.
+
+    ``local-clean --icloud-delete``, ``video-clean --icloud-delete`` and
+    ``video-optimise`` each call ``clean_icloud.arm()`` deep inside their own
+    ``run_*`` function — well after argument parsing, so nothing at the call
+    site was catching what it can raise. ``sync`` and ``icloud-delete`` already
+    handled this at their own call sites; these three did not, so a session
+    that had simply expired between one run and the next surfaced as a raw
+    Python traceback (``SessionExpiredError: ...``) instead of red text and an
+    exit code — read by a user as "this app broke", not "please log in again".
+    """
+    try:
+        raise typer.Exit(command())
+    except AccountPreconditionError as exc:
+        _fail(str(exc), 2)
+    except SessionExpiredError as exc:
+        _fail(str(exc), 3)
+    except ICloudSyncError as exc:
+        _fail(str(exc), 1)
 
 
 def _install_signal_handlers(cancel: Event) -> None:
@@ -411,7 +434,7 @@ def local_clean(
     setup_logging(config.logs_dir, config.verbose)
     icloud = _build_icloud_delete(ctx, output_root, enabled=icloud_delete,
                                   dry_run=icloud_dry_run, max_delete=max_delete)
-    raise typer.Exit(run_local_clean(config, icloud))
+    _run_guarded(lambda: run_local_clean(config, icloud))
 
 
 @app.command("video-clean")
@@ -449,7 +472,7 @@ def video_clean(
     setup_logging(config.logs_dir, config.verbose)
     icloud = _build_icloud_delete(ctx, output_root, enabled=icloud_delete,
                                   dry_run=icloud_dry_run, max_delete=max_delete)
-    raise typer.Exit(run_video_clean(config, icloud))
+    _run_guarded(lambda: run_video_clean(config, icloud))
 
 
 @app.command("video-optimise")
@@ -551,7 +574,7 @@ def video_optimise(
     setup_logging(config.logs_dir, config.verbose)
     cancel = Event()
     _install_signal_handlers(cancel)
-    raise typer.Exit(run_optimise(config, icloud, progress=tqdm, cancel=cancel))
+    _run_guarded(lambda: run_optimise(config, icloud, progress=tqdm, cancel=cancel))
 
 
 @app.command("icloud-delete")
