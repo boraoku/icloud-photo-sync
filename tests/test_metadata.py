@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -596,3 +597,207 @@ class TestInferCaptureDate:
         dt, source = md.infer_capture_date(src, "2021/06/IMG-20191025-WA0007.txt")
         assert dt == datetime(2019, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
         assert source == md.SOURCE_FILENAME
+
+
+# --- read_embedded_capture_dates (the bulk read) --------------------------------
+
+
+def _exiftool_batch_run(by_name, *, returncode=0, calls=None, stdout=None):
+    """A subprocess double standing in for ``exiftool -@ argfile``. Reads the
+    argfile the way the real tool would, so the test also proves the file was
+    written correctly rather than only that the JSON was parsed."""
+    def run(argv, **kw):
+        if calls is not None:
+            calls.append(argv)
+        assert argv[0] == "exiftool" and argv[1] == "-@"
+        lines = Path(argv[2]).read_text(encoding="utf-8").splitlines()
+        paths = [ln for ln in lines if not ln.startswith("-")]
+        if stdout is not None:
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+        entries = []
+        for p in paths:
+            entry = {"SourceFile": p}
+            value = by_name.get(Path(p).name)
+            if value:
+                entry["DateTimeOriginal"] = value
+            entries.append(entry)
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(entries), stderr="")
+    return run
+
+
+class TestReadEmbeddedCaptureDates:
+    def _photos(self, tmp_path, *names):
+        out = []
+        for n in names:
+            p = tmp_path / n
+            p.write_bytes(b"x")
+            out.append(p)
+        return out
+
+    def test_reads_a_whole_batch_in_one_subprocess(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic", "b.heic", "c.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        calls = []
+        monkeypatch.setattr(subprocess, "run", _exiftool_batch_run(
+            {"a.heic": "2019:10:25 15:07:50", "c.heic": "2020:01:02 03:04:05"},
+            calls=calls))
+
+        result = md.read_embedded_capture_dates(paths)
+
+        assert len(calls) == 1                       # one process for all three
+        assert result[paths[0]] == datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+        assert result[paths[1]] is None              # present in the batch, no date
+        assert result[paths[2]] == datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    def test_every_requested_path_appears_in_the_result(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic", "b.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        monkeypatch.setattr(subprocess, "run", _exiftool_batch_run({}))
+
+        result = md.read_embedded_capture_dates(paths)
+
+        assert set(result) == set(paths)
+
+    def test_chunks_at_the_batch_size(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, *[f"p{i}.heic" for i in range(5)])
+        monkeypatch.setattr(md, "EXIFTOOL_BATCH", 2)
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        calls = []
+        monkeypatch.setattr(subprocess, "run", _exiftool_batch_run({}, calls=calls))
+
+        md.read_embedded_capture_dates(paths)
+
+        assert len(calls) == 3                       # 2 + 2 + 1
+
+    def test_non_image_suffixes_are_never_sent_to_exiftool(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic", "clip.mov", "notes.txt")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        sent = []
+
+        def run(argv, **kw):
+            sent.extend(
+                ln for ln in Path(argv[2]).read_text(encoding="utf-8").splitlines()
+                if not ln.startswith("-")
+            )
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        result = md.read_embedded_capture_dates(paths)
+
+        assert [Path(s).name for s in sent] == ["a.heic"]
+        assert result[paths[1]] is None and result[paths[2]] is None
+
+    def test_a_nonzero_exit_still_uses_the_json_it_produced(self, tmp_path, monkeypatch):
+        # exiftool exits 1 when ANY file in a batch is unreadable, while still
+        # emitting good records for the rest. Discarding those would make one
+        # bad photo blank out its whole batch.
+        paths = self._photos(tmp_path, "good.heic", "bad.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        monkeypatch.setattr(subprocess, "run", _exiftool_batch_run(
+            {"good.heic": "2019:10:25 15:07:50"}, returncode=1))
+
+        result = md.read_embedded_capture_dates(paths)
+
+        assert result[paths[0]] == datetime(2019, 10, 25, 15, 7, 50, tzinfo=timezone.utc)
+        assert result[paths[1]] is None
+
+    def test_unparseable_json_reports_the_batch_as_dateless(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        monkeypatch.setattr(subprocess, "run",
+                            _exiftool_batch_run({}, stdout="not json at all"))
+
+        assert md.read_embedded_capture_dates(paths) == {paths[0]: None}
+
+    def test_a_crashing_subprocess_reports_the_batch_as_dateless(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+
+        def run(argv, **kw):
+            raise OSError("exiftool vanished")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        assert md.read_embedded_capture_dates(paths) == {paths[0]: None}
+
+    def test_leaves_no_argfile_behind(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        seen = []
+        monkeypatch.setattr(subprocess, "run", _exiftool_batch_run({}, calls=seen))
+
+        md.read_embedded_capture_dates(paths)
+
+        assert not Path(seen[0][2]).exists()
+
+    def test_no_exiftool_means_every_path_is_dateless(self, tmp_path, monkeypatch):
+        paths = self._photos(tmp_path, "a.heic")
+        monkeypatch.setattr(md.shutil, "which", _which_present())
+        monkeypatch.setattr(subprocess, "run", _never_called)
+
+        assert md.read_embedded_capture_dates(paths) == {paths[0]: None}
+
+    def test_empty_input(self):
+        assert md.read_embedded_capture_dates([]) == {}
+
+
+def _never_called(*a, **kw):
+    raise AssertionError("subprocess.run must not be called here")
+
+
+# --- known_absent ----------------------------------------------------------------
+
+
+class TestKnownAbsent:
+    """The bulk read has already established absence, so the per-file
+    presence check would re-read the same file for the same answer."""
+
+    def test_known_absent_skips_the_presence_read(self, tmp_path, monkeypatch):
+        src = tmp_path / "photo.heic"
+        src.write_bytes(b"original")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        argvs = []
+
+        def run(argv, **kw):
+            argvs.append(argv)
+            (tmp_path / "photo.heic.meta.part").write_bytes(b"stamped")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", run)
+
+        outcome = md.ensure_capture_date(src, CAPTURE_DT, known_absent=True)
+
+        assert outcome is md.MetadataOutcome.STAMPED
+        assert len(argvs) == 1                       # the write only
+        assert "-s3" not in argvs[0]                 # no read happened
+
+    def test_default_still_reads_before_writing(self, tmp_path, monkeypatch):
+        src = tmp_path / "photo.heic"
+        src.write_bytes(b"original")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        argvs = []
+
+        def run(argv, **kw):
+            argvs.append(argv)
+            if "-s3" in argv:
+                return SimpleNamespace(returncode=0, stdout="\n\n", stderr="")
+            (tmp_path / "photo.heic.meta.part").write_bytes(b"stamped")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", run)
+
+        md.ensure_capture_date(src, CAPTURE_DT)
+
+        assert "-s3" in argvs[0]                     # the read-before-write fence
+        assert len(argvs) == 2
+
+    def test_known_absent_never_bypasses_an_existing_date_for_other_callers(self, tmp_path, monkeypatch):
+        # The fence that matters: default callers are untouched by this
+        # parameter existing, and still refuse to overwrite a real date.
+        src = tmp_path / "photo.heic"
+        src.write_bytes(b"original")
+        monkeypatch.setattr(md.shutil, "which", _which_present("exiftool"))
+        monkeypatch.setattr(subprocess, "run", lambda argv, **kw: SimpleNamespace(
+            returncode=0, stdout="2019:10:25 15:07:50\n\n", stderr=""))
+
+        assert md.ensure_capture_date(src, CAPTURE_DT) is md.MetadataOutcome.ALREADY_PRESENT
+        assert src.read_bytes() == b"original"

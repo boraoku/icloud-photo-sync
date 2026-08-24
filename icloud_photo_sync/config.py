@@ -198,6 +198,14 @@ class LocalCleanConfig:
     cache_db: Path
     logs_dir: Path
 
+    date_cache_db: Path | None = None
+    """Where ``photo-optimise-external``'s date-recovery phase remembers what
+    it has already checked. A second database rather than a table inside
+    ``cache_db``: the two answer unrelated questions about different sets of
+    files (every photo vs. only small ones), and keeping them apart means
+    ``--reclassify`` and ``--recheck-dates`` can never clear each other's
+    work. Unused by ``local-clean`` itself."""
+
     lm_base_url: str = DEFAULT_LM_BASE_URL
     lm_model: str = DEFAULT_LM_MODEL
     max_bytes: int = DEFAULT_CLEAN_MAX_BYTES
@@ -206,6 +214,9 @@ class LocalCleanConfig:
     port: int = 0
     limit: int | None = None
     reclassify: bool = False
+    recheck_dates: bool = False
+    """``photo-optimise-external --recheck-dates``: ignore the date cache and
+    re-examine every photo, the date-phase counterpart to ``--reclassify``."""
     open_browser: bool = True
     verbose: bool = False
 
@@ -224,12 +235,15 @@ class LocalCleanConfig:
         config_root = (config_root or default_config_root()).resolve()
         logs_dir = config_root / "logs"
         state_dir = config_root / "state"
-        cache_db = state_dir / f"local-clean-{_clean_cache_key(output_root)}.db"
+        key = _clean_cache_key(output_root)
+        cache_db = state_dir / f"local-clean-{key}.db"
+        date_cache_db = state_dir / f"photo-dates-{key}.db"
 
         for d in (config_root, logs_dir, state_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        cfg = cls(output_root=output_root, cache_db=cache_db, logs_dir=logs_dir)
+        cfg = cls(output_root=output_root, cache_db=cache_db, logs_dir=logs_dir,
+                  date_cache_db=date_cache_db)
         for k, v in overrides.items():
             if not hasattr(cfg, k):
                 # Match AppConfig.create: a silently-dropped typo would run with

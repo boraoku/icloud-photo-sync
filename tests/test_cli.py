@@ -146,3 +146,45 @@ class TestSessionExpiredIsCleanEverywhere:
         ])
         assert result.exit_code == 0
         assert "login" not in result.output
+
+
+# --- the long-running commands must actually report progress -------------------
+
+
+class TestProgressIsWired:
+    """The bug this guards: ``photo-optimise-external`` built a tqdm bar
+    internally but the CLI never handed it a factory, so a 47,000-photo run
+    printed nothing at all for over an hour. The bar working is not enough —
+    the wiring has to be there, which is exactly what was missing.
+    """
+
+    def test_photo_optimise_external_passes_a_progress_factory(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_run(config, *, echo=None, progress=None, dry_run=False):
+            seen["progress"] = progress
+            return 0
+
+        monkeypatch.setattr(cli, "run_photo_optimise_external", fake_run)
+        result = runner.invoke(app, [
+            "-d", str(tmp_path), "photo-optimise-external", "--dry-run",
+        ])
+
+        assert result.exit_code == 0
+        assert seen["progress"] is not None, "no progress factory reached Phase A"
+        assert callable(seen["progress"])
+
+    def test_video_optimise_external_passes_a_progress_factory(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_run(config, **kwargs):
+            seen.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(cli, "run_optimise_external", fake_run)
+        result = runner.invoke(app, [
+            "-d", str(tmp_path), "video-optimise-external", "--dry-run",
+        ])
+
+        assert result.exit_code == 0
+        assert seen.get("progress") is not None

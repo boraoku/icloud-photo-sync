@@ -464,6 +464,10 @@ def photo_optimise_external(
     reclassify: bool = typer.Option(
         False, "--reclassify", help="Phase B: ignore the classification cache and redo everything."
     ),
+    recheck_dates: bool = typer.Option(
+        False, "--recheck-dates",
+        help="Phase A: ignore the date cache and re-examine every photo.",
+    ),
     no_browser: bool = typer.Option(
         False, "--no-browser", help="Print the review URL instead of opening a browser."
     ),
@@ -501,11 +505,13 @@ def photo_optimise_external(
         limit=limit,
         port=port,
         reclassify=reclassify,
+        recheck_dates=recheck_dates,
         open_browser=not no_browser,
         verbose=octx.verbose,
     )
     setup_logging(config.logs_dir, config.verbose)
-    _run_guarded(lambda: run_photo_optimise_external(config, dry_run=dry_run))
+    _run_guarded(lambda: run_photo_optimise_external(
+        config, progress=tqdm, dry_run=dry_run))
 
 
 @app.command("video-clean")

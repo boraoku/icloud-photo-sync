@@ -125,7 +125,8 @@ icloud-photo-sync [GLOBAL] video-optimise-external [--min-size SIZE] [--short-si
                                        [--keep-originals] [--port N] [--no-browser]
 icloud-photo-sync [GLOBAL] photo-optimise-external [--max-size SIZE] [--lm-url URL]
                                        [--lm-model NAME] [--flag CATS] [--limit N]
-                                       [--reclassify] [--no-browser] [--dry-run]
+                                       [--reclassify] [--recheck-dates]
+                                       [--no-browser] [--dry-run]
 icloud-photo-sync [GLOBAL] icloud-delete (--last | --from MANIFEST | --explain RECEIPT
                                         | --scan-trashed)
                                        [--dry-run] [--max-delete N]
@@ -478,6 +479,19 @@ Two phases, always in order:
    above, just called automatically right after phase 1. Takes the same
    flags as `local-clean` except `--icloud-delete`/`--icloud-dry-run`/
    `--max-delete` (this command never touches iCloud, even optionally).
+
+Phase 1 is **resumable**: what it concludes about each photo is remembered,
+so stopping with Ctrl-C and re-running picks up where it left off instead of
+starting over. A photo is re-examined automatically if it changes (its size
+or modified-time won't match) or moves (its path won't match);
+`--recheck-dates` forces a full re-examination of everything, the date-phase
+counterpart to `--reclassify`.
+
+It is also fast. Reading a photo's embedded date takes about 3 ms, but
+starting a process to do it takes about 89 ms — so the dates are read in
+batches, one `exiftool` per few hundred photos rather than one per photo.
+On a 47,000-photo library that is the difference between roughly 70 minutes
+and roughly 3.
 
 ### Both commands, shared date-recovery rule
 
